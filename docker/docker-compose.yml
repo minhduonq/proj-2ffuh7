@@ -1,0 +1,27 @@
+services:
+  participant-pipeline:
+    container_name: participant-pipeline
+    image: participant-pipeline:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ../generated_outputs:/workspace/generated_outputs
+      - huggingface-cache:/root/.cache/huggingface
+      - torch-cache:/root/.cache/torch
+    ports:
+      - "10006:10006"
+    # Judge vLLM keeps its multimodal processor cache in /dev/shm (see judge-critic-instance extra_args).
+    shm_size: "32gb"
+    # runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/root/.cache/huggingface
+      - OPENROUTER_API_KEY=placeholder
+
+volumes:
+  huggingface-cache:
+    driver: local
+  torch-cache:
+    driver: local
