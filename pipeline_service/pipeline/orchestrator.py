@@ -5,8 +5,8 @@ import time
 
 import httpx
 
-from config.settings import BracketConfig, OrientationConfig, RefineConfig
 from llm.session_store import SessionStore
+from config.settings import OrientationConfig, RefineConfig
 from logger_config import logger
 from pipeline.stages import (
     code_and_check,
@@ -47,10 +47,10 @@ class Pipeline:
         coder_ensemble_temperature: float = 0.3,
         render_from_object: bool = False,
         seed_offset: int = 0,
-        bracket: BracketConfig | None = None,
         orientation: OrientationConfig | None = None,
-        prefilter_keep: int = 0,
+        candidate_deadline_s: float = 0.0,
         refine: RefineConfig | None = None,
+        code_fix: bool = False,
         refinement_enabled: bool = True,
         planner_limit: int = 2,
         coder_limit: int = 2,
@@ -74,10 +74,10 @@ class Pipeline:
         self.coder_ensemble_temperature = coder_ensemble_temperature
         self.render_from_object = render_from_object
         self.seed_offset = seed_offset
-        self.bracket = bracket or BracketConfig()
         self.orientation = orientation or OrientationConfig()
-        self.prefilter_keep = prefilter_keep
+        self.candidate_deadline_s = candidate_deadline_s
         self.refine = refine or RefineConfig()
+        self.code_fix = code_fix
         self.refinement_enabled = refinement_enabled
 
         self.max_iter = max_iter
@@ -145,9 +145,9 @@ class Pipeline:
                     ensemble_temperature=self.coder_ensemble_temperature,
                     render_from_object=self.render_from_object,
                     seed_offset=self.seed_offset,
-                    bracket=self.bracket,
                     orientation=self.orientation,
-                    prefilter_keep=self.prefilter_keep,
+                    candidate_deadline_s=self.candidate_deadline_s,
+                    code_fix=self.code_fix,
                 )
                 await self._maybe_refine(task)
             else:
@@ -209,14 +209,16 @@ class Pipeline:
            
 
     async def _maybe_refine(self, task: PipelineTask) -> None:
-        """Critic -> ve lai tren ban thang bracket, trong khung gio cua lo. Khong bao gio lam hong de.
+        """Fresh critic-regeneration of the bracket winner inside the batch's time window. Never fails the task.
 
-        Moc tinh tu luc LO bat dau (task.batch_started_at; de chay lai van giu moc cua lo; warmup thi tinh tu
-        luc de bat dau). Qua `start_cutoff_s` thi bo qua; den `deadline_s` thi huy buoc ve lai dang chay —
-        ban thang bracket chi bi thay o dong cuoi cua buoc nay.
+        Clocks run from the batch start (task.batch_started_at; a retried prompt keeps its batch's clock; warmup
+        falls back to the task start). Past `start_cutoff_s` refine is skipped; at `deadline_s` a running refine is
+        cancelled. The bracket winner is replaced only in the last lines of refine_regen_stage.
         """
         cfg = self.refine
         if not cfg.enabled or self.judge is None or self.critic is None:
+            return
+        if task.stem == "warmup_task":           # keep the startup warmup exactly as long as the baseline's
             return
         started = task.batch_started_at or task.started_at or time.time()
         elapsed = time.time() - started
@@ -248,18 +250,19 @@ class Pipeline:
                     seed_offset=self.seed_offset,
                     render_from_object=self.render_from_object,
                     orientation=self.orientation,
+                    code_fix=self.code_fix,
                 ),
                 timeout=budget,
             )
         except TimeoutError:
             info = task.meta.setdefault("refine", {})
             info["timeout"] = f"deadline_s {cfg.deadline_s:.0f}s (budget {budget:.0f}s)"
-            logger.warning(f"[REFINE] {task.stem} cut at deadline ({budget:.0f}s budget) — bracket winner kept")
+            logger.warning(f"[REFINE] {task.stem} cut at deadline ({budget:.0f}s budget) - bracket winner kept")
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - buoc sua khong duoc lam hong de
+        except Exception as exc:  # noqa: BLE001 - refine must never fail the task
             task.meta.setdefault("refine", {})["error"] = f"{type(exc).__name__}: {exc}"
-            logger.warning(f"[REFINE] {task.stem} failed: {type(exc).__name__}: {exc} — bracket winner kept")
+            logger.warning(f"[REFINE] {task.stem} failed: {type(exc).__name__}: {exc} - bracket winner kept")
 
     async def run_one(self, task: PipelineTask) -> PipelineTask:
         task.started_at = time.time()

@@ -98,6 +98,8 @@ async def _decide(embedder, ref_vec, views: dict[str, bytes]) -> tuple[dict[str,
 
     if best is ProbeView.FRONT:
         return sims, None
+    if best is ProbeView.BACK:
+        return sims, None
     if best in _SIDE_YAW:
         return sims, Rotation(
             best_view=best,
@@ -136,17 +138,18 @@ async def orient_task(
     """Probe, decide, and rewrite `task.js_code` / `task.scene_json` in place when a rotation helps.
 
     The probe render and the re-check hold their own stage's semaphore, so neither waits on the other's
-    pool; the render slot covers only the sidecar request, not decoding the views.
-    Every failure path leaves the task untouched: a candidate is never dropped for failing to rotate.
+    pool. Every failure path leaves the task untouched: a candidate is never dropped for failing to rotate.
     """
     if not config.enabled or embedder is None or ref_vec is None:
         return OrientationResult(reason="disabled")
 
+    render_guard = sem_render if sem_render is not None else contextlib.nullcontext()
     check_guard = sem_check if sem_check is not None else contextlib.nullcontext()
 
-    views = await renderer.render_views(
-        task, [v.value for v in ProbeView], img_size=config.img_size, slot=sem_render
-    )
+    async with render_guard:
+        views = await renderer.render_views(
+            task, [v.value for v in ProbeView], img_size=config.img_size
+        )
     if not views:
         return OrientationResult(reason="probe_failed")
 

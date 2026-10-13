@@ -47,46 +47,43 @@ function geometryIsDirty(geo) {
   return false;
 }
 
-function serializableParameters(parameters) {
-  const out = {};
-  for (const key in parameters) {
-    if (typeof parameters[key] !== 'function') out[key] = parameters[key];
-  }
-  return out;
-}
-
-const LOADER_BUFFER_TYPES = new Set(['BufferGeometry', 'InstancedBufferGeometry']);
-const LOADER_CURVE_TYPES = new Set([
+// Curve classes ObjectLoader can rebuild (three/src/extras/curves). A user-defined `class X extends THREE.Curve`
+// (or a CurvePath) used as a TubeGeometry path / ExtrudeGeometry extrudePath makes ObjectLoader throw
+// "Curves[data.path.type] is not a constructor" on the render side, so such geometries must be baked.
+const BUILTIN_CURVES = new Set([
   'ArcCurve', 'CatmullRomCurve3', 'CubicBezierCurve', 'CubicBezierCurve3', 'EllipseCurve',
   'LineCurve', 'LineCurve3', 'QuadraticBezierCurve', 'QuadraticBezierCurve3', 'SplineCurve',
 ]);
 
-function loaderCanRebuild(geo) {
-  if (LOADER_BUFFER_TYPES.has(geo.type)) return true;
-  const Ctor = THREE[geo.type];
-  if (typeof Ctor !== 'function' || typeof Ctor.fromJSON !== 'function') return false;
+// Parametric geometries whose JSON form ObjectLoader cannot rehydrate:
+//  - dirty attributes (the module edited vertices after construction) -> parameters no longer describe the mesh
+//  - no `static fromJSON` on the class (EdgesGeometry, WireframeGeometry, user subclasses) -> "Geometries[data.type].fromJSON is not a function"
+//  - TubeGeometry / ExtrudeGeometry driven by a non-built-in curve -> "Curves[data.path.type] is not a constructor"
+function geometryNeedsBake(geo) {
+  if (geometryIsDirty(geo)) return true;
+  const ctor = THREE[geo.type];
+  if (!ctor || typeof ctor.fromJSON !== 'function') return true;
   if (geo.type === 'TubeGeometry') {
     const path = geo.parameters && geo.parameters.path;
-    return Boolean(path) && LOADER_CURVE_TYPES.has(path.type);
+    if (!path || !BUILTIN_CURVES.has(path.type)) return true;
   }
-  return true;
+  if (geo.type === 'ExtrudeGeometry') {
+    const ep = geo.parameters && geo.parameters.options && geo.parameters.options.extrudePath;
+    if (ep && !BUILTIN_CURVES.has(ep.type)) return true;
+  }
+  return false;
 }
 
-function bakeNonReconstructableGeometries(root) {
+function bakeModifiedParametricGeometries(root) {
   const baked = new Map();
   root.traverse((o) => {
     const geo = o.geometry;
-    if (!geo) return;
-    const rebuildable = loaderCanRebuild(geo);
-    const isEditedParametric = geo.parameters !== undefined && geometryIsDirty(geo);
-    if (rebuildable && !isEditedParametric) return;
+    if (!geo || geo.parameters === undefined || !geometryNeedsBake(geo)) return;
     if (!baked.has(geo)) {
       const bg = new THREE.BufferGeometry().copy(geo);
       bg.userData = {
         ...(geo.userData || {}),
-        originalGeometry: rebuildable
-          ? { type: geo.type, parameters: serializableParameters(geo.parameters) }
-          : { type: geo.type },
+        originalGeometry: { type: geo.type, parameters: { ...geo.parameters } },
       };
       baked.set(geo, bg);
     }
@@ -245,7 +242,7 @@ function run() {
     let object = null;
     if (postResult.failures.length === 0) {
       try {
-        bakeNonReconstructableGeometries(rawResult);
+        bakeModifiedParametricGeometries(rawResult);
         object = rawResult.toJSON();
       } catch (err) {
         send({

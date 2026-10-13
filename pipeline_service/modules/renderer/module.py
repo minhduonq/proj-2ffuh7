@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import os
 import random
 import signal
@@ -16,6 +15,7 @@ from logger_config import logger
 from modules.base import BaseModule
 from modules.renderer.grid import GRID_KEYS, GRID_VIEWS, compose_grid
 from modules.renderer.settings import RendererConfig
+from pipeline.batch_stats import STATS
 from pipeline.task import PipelineTask
 
 _RUNNER_JS = Path(__file__).parent / "render_service" / "render_runner.mjs"
@@ -48,8 +48,8 @@ class _Slot:
 
 class RendererModule(BaseModule):
     _PING_INTERVAL_S = 5.0
-    _PING_TIMEOUT_S = 15.0
-    _PING_STRIKES = 6
+    _PING_TIMEOUT_S = 5.0
+    _PING_STRIKES = 3
     _SPAWN_BACKOFF_INITIAL_S = 1.0
     _SPAWN_BACKOFF_MAX_S = 30.0
     _TERM_GRACE_S = 5.0
@@ -97,6 +97,7 @@ class RendererModule(BaseModule):
 
     async def _supervise(self, slot: _Slot) -> None:
         backoff = self._SPAWN_BACKOFF_INITIAL_S
+        spawned = 0
         while not self._shutting_down:
             try:
                 sc = await self._spawn_sidecar(slot.idx)
@@ -106,10 +107,14 @@ class RendererModule(BaseModule):
                 logger.warning(
                     f"[RENDERER] sidecar #{slot.idx} spawn failed: {exc} — retry in {backoff:.0f}s"
                 )
+                STATS.sidecar_spawn_fail()
                 await asyncio.sleep(backoff + random.uniform(0.0, 0.5))
                 backoff = min(backoff * 2.0, self._SPAWN_BACKOFF_MAX_S)
                 continue
 
+            if spawned:
+                STATS.sidecar_restart()  # a re-spawn after a monitored death (participant-diag `render=.../restarts`)
+            spawned += 1
             ready_at = time.monotonic()
             slot.sidecar = sc
             try:
@@ -148,13 +153,7 @@ class RendererModule(BaseModule):
         stderr_task = asyncio.create_task(
             self._pipe_logger(proc.stderr, f"#{idx}/stderr")
         )
-        # Idle connections expire well before the sidecar's keepAliveTimeout
-        # (render_runner.mjs), so a pooled connection is never reused just as
-        # the server closes it — that race surfaced as ReadError retries.
-        client = httpx.AsyncClient(
-            timeout=self.config.request_timeout_s,
-            limits=httpx.Limits(keepalive_expiry=30.0),
-        )
+        client = httpx.AsyncClient(timeout=self.config.request_timeout_s)
         try:
             browser_pid = await self._wait_ready_for(proc, client, port, idx)
         except BaseException:
@@ -268,13 +267,6 @@ class RendererModule(BaseModule):
         self._dispatch_counter += 1
         return sc
 
-    @staticmethod
-    def _hold(slot: asyncio.Semaphore | None):
-        """Guard for the sidecar request only. ``slot`` is the pipeline's render
-        semaphore; decoding the views and composing the grid run after it is
-        released, so they never keep a render slot busy."""
-        return slot if slot is not None else contextlib.nullcontext()
-
     async def _post_with_retry(self, path: str, payload: dict) -> tuple[httpx.Response, int]:
         """POST to a live sidecar; on a dead-channel error retry once,
         preferring a different sidecar. Renders are idempotent, so with a
@@ -309,15 +301,13 @@ class RendererModule(BaseModule):
             )
             return resp, retry_sc.idx
 
-    async def process(
-        self, task: PipelineTask, slot: asyncio.Semaphore | None = None
-    ) -> PipelineTask:
+    async def process(self, task: PipelineTask) -> PipelineTask:
         """Render the 2x2 grid (4 orbit views composed in Python)."""
-        await self._render_and_fill(task, self._grid_specs(), slot)
+        await self._render_and_fill(task, self._grid_specs())
         return task
 
     async def process_with_judge_views(
-        self, task: PipelineTask, slot: asyncio.Semaphore | None = None
+        self, task: PipelineTask
     ) -> tuple[dict[str, bytes], dict[str, bytes]]:
         """Grid + judge views in one sidecar request; fills the same task fields
         as ``process()`` and returns ``(white_views, gray_views)``.
@@ -329,25 +319,17 @@ class RendererModule(BaseModule):
             "bg": self.config.judge_gray_bg,
             "key": self._JUDGE_GRAY_KEY,
         })
-        rendered = await self._render_and_fill(task, specs, slot)
+        rendered = await self._render_and_fill(task, specs)
 
         gray_png = rendered.pop(self._JUDGE_GRAY_KEY, None)
         gray = {self._JUDGE_GRAY_VIEW: gray_png} if gray_png else {}
         return rendered, gray
 
     async def render_views(
-        self,
-        task: PipelineTask,
-        views: list[str],
-        *,
-        img_size: int,
-        slot: asyncio.Semaphore | None = None,
+        self, task: PipelineTask, views: list[str], *, img_size: int
     ) -> dict[str, bytes]:
-        """Render named preset views only, at ``img_size``, on the judge's white background.
-
-        No grid, no mutation of the task: a probe the caller reads and discards.
-        Returns an empty dict on any failure — callers treat that as "no decision".
-        """
+        """Render named preset views only, at ``img_size``, on the judge's white background (orientation probe).
+        No grid, no mutation of the task; returns an empty dict on any failure (callers treat that as "no decision")."""
         if task.failed or (not task.js_code and not task.scene_json):
             return {}
         payload: dict = {
@@ -358,25 +340,19 @@ class RendererModule(BaseModule):
             payload["object"] = task.scene_json
         else:
             payload["source"] = task.js_code
-
-        async with self._hold(slot):
-            try:
-                resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
-            except Exception as exc:  # noqa: BLE001 - a probe never fails its caller
-                logger.warning(f"[RENDERER] '{task.stem}' probe FAIL (http) | {type(exc).__name__}: {exc}")
-                return {}
-        if resp.status_code != 200:
-            logger.warning(
-                f"[RENDERER] '{task.stem}' probe FAIL (status) sidecar=#{sidecar_idx} | "
-                f"HTTP {resp.status_code}: {resp.text[:200] if resp.text else ''}"
-            )
+        try:
+            resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
+        except Exception as exc:  # a probe never fails its caller
+            logger.warning(f"[RENDERER] '{task.stem}' probe FAIL (http) | {type(exc).__name__}: {exc}")
             return {}
-
+        if resp.status_code != 200:
+            logger.warning(f"[RENDERER] '{task.stem}' probe FAIL (status) sidecar=#{sidecar_idx} | HTTP {resp.status_code}")
+            return {}
         rendered: dict[str, bytes] = {}
         for name, b64 in (resp.json().get("views") or {}).items():
             try:
                 rendered[name] = base64.b64decode(b64)
-            except Exception as exc:  # noqa: BLE001 - skip a single bad view, keep the rest
+            except Exception as exc:  # skip a single bad view, keep the rest
                 logger.warning(f"[RENDERER] probe view {name!r} decode failed: {exc}")
         return rendered
 
@@ -396,9 +372,7 @@ class RendererModule(BaseModule):
     _JUDGE_GRAY_VIEW = "front_left"
     _JUDGE_GRAY_KEY = "front_left_gray"
 
-    async def _render_and_fill(
-        self, task: PipelineTask, view_specs: list[dict], slot: asyncio.Semaphore | None = None
-    ) -> dict[str, bytes]:
+    async def _render_and_fill(self, task: PipelineTask, view_specs: list[dict]) -> dict[str, bytes]:
         """One /render/views request: grid tiles composed into ``task.rendered_png``
         (missing/invalid tile is fatal), remaining views returned."""
         if task.failed or (not task.js_code and not task.scene_json):
@@ -421,27 +395,30 @@ class RendererModule(BaseModule):
             payload["source"] = task.js_code
             size_note = f"js_code={len(task.js_code)} bytes"
 
-        async with self._hold(slot):
-            logger.info(
-                f"[RENDERER] '{task.stem}' start | views={len(view_specs)} "
-                f"| path={'object' if use_object else 'code'} | {size_note}"
+        logger.info(
+            f"[RENDERER] '{task.stem}' start | views={len(view_specs)} "
+            f"| path={'object' if use_object else 'code'} | {size_note}"
+        )
+
+        t0 = time.monotonic()
+        try:
+            resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            task.render_errors = [f"{type(exc).__name__}: {exc}"]
+            STATS.render_done(time.monotonic() - t0, False)
+            logger.warning(
+                f"[RENDERER] '{task.stem}' FAIL (http) | {task.render_errors[0]}"
             )
+            return {}
 
-            t0 = time.monotonic()
-            try:
-                resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
-            except Exception as exc:
-                task.render_errors = [f"{type(exc).__name__}: {exc}"]
-                logger.warning(
-                    f"[RENDERER] '{task.stem}' FAIL (http) | {task.render_errors[0]}"
-                )
-                return {}
-
-            task.render_ms = (time.monotonic() - t0) * 1000.0
+        task.render_ms = (time.monotonic() - t0) * 1000.0
 
         if resp.status_code != 200:
             detail = resp.text[:200] if resp.text else ""
             task.render_errors = [f"HTTP {resp.status_code}: {detail}"]
+            STATS.render_done(task.render_ms / 1000.0, False)
             logger.warning(
                 f"[RENDERER] '{task.stem}' FAIL (status) sidecar=#{sidecar_idx} | "
                 f"{task.render_errors[0]} | render={task.render_ms/1000:.1f}s"
@@ -457,17 +434,19 @@ class RendererModule(BaseModule):
 
         try:
             tiles = [rendered.pop(key) for key in GRID_KEYS]
-            task.rendered_png = await asyncio.to_thread(
-                compose_grid, tiles, img_size=self.config.img_size, gap=self.config.grid_gap
+            task.rendered_png = compose_grid(
+                tiles, img_size=self.config.img_size, gap=self.config.grid_gap
             )
         except (KeyError, ValueError) as exc:
             task.render_errors = [f"grid tile invalid: {exc}"]
+            STATS.render_done(task.render_ms / 1000.0, False)
             logger.warning(
                 f"[RENDERER] '{task.stem}' FAIL (grid) sidecar=#{sidecar_idx} | "
                 f"{task.render_errors[0]}"
             )
             return rendered
 
+        STATS.render_done(task.render_ms / 1000.0, True)
         task.refinement_rendered_pngs.append(task.rendered_png)
         logger.info(
             f"[RENDERER] '{task.stem}' PASS sidecar=#{sidecar_idx} | "

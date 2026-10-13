@@ -14,6 +14,7 @@ async def async_retry(
     max_retries: int = 3,
     delays: tuple[float, ...] = DEFAULT_DELAYS,
     on_attempt_failed: Callable[[int, BaseException], None] | None = None,
+    no_retry: tuple[type[BaseException], ...] = (),
 ) -> T:
     """
     Run `fn(attempt, last_err)` up to `max_retries`+1 times.
@@ -28,6 +29,8 @@ async def async_retry(
             last_err_str = f"{type(exc).__name__}: {exc}"
             if on_attempt_failed is not None:
                 on_attempt_failed(attempt, exc)
+            if isinstance(exc, no_retry):
+                break  # e.g. a request timeout: retrying re-spends the whole timeout
             if attempt >= max_retries:
                 break
             delay = delays[min(attempt, len(delays) - 1)]

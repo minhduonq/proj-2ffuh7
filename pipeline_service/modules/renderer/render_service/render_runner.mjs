@@ -285,12 +285,6 @@ process.on('unhandledRejection', (err) => {
   process.exit(1);
 });
 
-// Node's 5s default equals httpx's default keepalive expiry, so the client could
-// reuse a connection just as the server closed it (ReadError). Keep idle
-// connections open far longer than the client pool does (30s, module.py).
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
-
 async function main() {
   console.log('[render_runner] starting static server...');
   await startStaticServer();

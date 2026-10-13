@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
 
 # Environment
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -45,7 +45,7 @@ COPY docker/requirements.lock.txt /tmp/requirements.lock.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m venv /opt/vllm-env && \
     /opt/vllm-env/bin/pip install pip==26.2.1 && \
-    /opt/vllm-env/bin/pip install --no-deps --extra-index-url https://download.pytorch.org/whl/cu129 -r /tmp/requirements.lock.txt
+    /opt/vllm-env/bin/pip install --no-deps --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/requirements.lock.txt
 
 # Node deps 
 WORKDIR /workspace

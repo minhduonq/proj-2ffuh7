@@ -1,17 +1,18 @@
-"""Refine: CRITIC -> VE LAI (khong doc ma cu) tren ban thang bracket.
+"""Refine: CRITIC -> FRESH REGENERATION (the coder never sees the old code) of the bracket winner.
 
-Cai tien rieng cua doi, chuyen tu worker v2 (nhanh C1 cua lab). Bang chung:
-  - kiem doc lap 40 de (doi thu thu hai, du 2 thu tu dat bai): C1 -0,11 diem phat [-0,24; +0,00];
-  - chay that 128 de vong 49: margin vs leader -0,047 -> -0,008 (doi bai 16 de: 9 tot len, 3 te di).
+Our own addition (lab branch C1, carried by workers v2/v3). Evidence:
+  - independent check, 40 prompts, second opponent, both seat orders: C1 -0.11 S1 penalty [-0.24; +0.00];
+  - full 128-prompt run of round 49: margin vs leader -0.047 -> -0.008 (16 prompts changed: 9 better, 3 worse).
 
-Quy trinh cho moi de (N = refine.candidates, mac dinh 4):
-  1. N nhan xet thi giac (critic GLM, moi ban mot seed) + N nhan xet KY THUAT DUNG HINH (GLM).
-  2. N ban ve lai tu dau: anh de + luoi render ban thang + nhan xet; KHONG dua ma cu.
-  3. Moi ban di dung duong cua ung vien bracket: kiem ma -> xoay theo anh de -> render + goc cham + DINO.
-     Hong o kiem ma/render thi cho sua 1 lan theo loi that.
-  4. Moi ban song dau voi ban thang (trong tai day du, du 4 goc S1). Nhan ban THANG va hon >= accept_margin
-     diem phat S1; nhieu ban dat thi lay ban hon nhieu nhat. Khong ban nao dat -> giu ban thang.
-Moi loi trong buoc nay deu bi nuot; ban thang bracket da nam san tren task va chi bi thay o dong cuoi.
+Per prompt (N = refine.candidates, default 4):
+  1. N visual critiques (critic GLM, one seed each) + N BUILD-TECHNIQUE critiques (GLM).
+  2. N programs written from scratch: reference + render grid of the winner + the critiques; NO old code.
+  3. Each takes exactly the bracket-candidate path: checker (+ rule fixes) -> orientation -> render + judge views
+     + DINO. A checker/render failure gets one coder fix with the real error.
+  4. Each live regeneration duels the winner (full judge, all 4 S1 angles). It is accepted only if it WINS and
+     beats the winner by >= accept_margin S1 penalty points; with several, the largest margin. None -> winner kept.
+Every error inside this stage is swallowed; the bracket winner already sits on the task and is only replaced in
+the final lines.
 """
 from __future__ import annotations
 
@@ -22,22 +23,20 @@ from typing import Any
 
 from config.settings import OrientationConfig
 from logger_config import logger
+from pipeline.seeding import prompt_seed
 from pipeline.stages import _CandidateFactory, _code_digest, _is_live
 from pipeline.task import Candidate, PipelineTask
 
-# Tham so giu dung nhu nhanh C1 cua lab.
 CRITIC_TEMPERATURE = 0.6
-CRITIC_SEED_BASE = 43            # lab: 42 + vong(1) + 100*ci
-STRUCT_SEED_BASE = 12            # lab: 11 + vong(1) + 100*ci
-REGEN_SEED_OFFSET = 500_000      # tach dong seed ve lai khoi dong seed cua K ung vien bracket
-REGEN_K_BASE = 1000              # so hieu k cua ban ve lai (k=1000+ci), khong trung ung vien bracket
+REGEN_SEED_OFFSET = 500_000      # keeps regeneration seeds apart from the K bracket candidates' stream
+REGEN_K_BASE = 1000              # regeneration candidate numbers (k = 1000 + ci) never collide with bracket ks
 
 
 def s1_margin(verdict: Any) -> float | None:
-    """Diem phat S1 trung binh (cac goc da cham, moi goc da trung binh 2 thu tu) cua B tru cua A.
+    """Mean S1 penalty (over the judged angles, each already averaged over both seat orders) of B minus A.
 
-    A = ban ve lai, B = ban thang. > 0 nghia la ban ve lai TOT HON (phat thap hon).
-    None khi trong tai khong tra chi tiet S1.
+    A = regeneration, B = bracket winner. > 0 means the regeneration is BETTER (lower penalty).
+    None when the judge returned no S1 detail.
     """
     detail = getattr(verdict, "detail", None) or {}
     angles = (detail.get("s1_slim") or {}).get("angles") or []
@@ -49,7 +48,7 @@ def s1_margin(verdict: Any) -> float | None:
 
 
 def build_feedback(report: Any, struct: dict | None) -> str | None:
-    """Loi nhan xet dua cho coder (cung dinh dang voi lab). None khi ca hai nguon nhan xet deu loi."""
+    """Critique text handed to the coder (lab format). None when both critiques failed."""
     if report is None and struct is None:
         return None
     parts: list[str] = []
@@ -98,8 +97,9 @@ async def refine_regen_stage(
     seed_offset: int = 0,
     render_from_object: bool = False,
     orientation: OrientationConfig | None = None,
+    code_fix: bool = False,
 ) -> dict:
-    """Chay buoc ve lai cho mot de. Tra ve (va ghi vao task.meta['refine']) ban tom tat."""
+    """Run refine for one prompt. Returns (and stores in task.meta['refine']) a summary."""
     t0 = time.time()
     info: dict[str, Any] = {"mode": "regen", "n_cand": n_cand, "accepted": None, "cands": []}
     task.meta["refine"] = info
@@ -112,7 +112,7 @@ async def refine_regen_stage(
         info["skipped"] = "no judge/critic or no live bracket winner with judge views"
         return info
 
-    # 1) nhan xet: N thi giac + N ky thuat, chay song song (GLM)
+    # 1) critiques: N visual + N build-technique, all in parallel (GLM)
     async def visual(ci: int):
         async with sem_critic:
             try:
@@ -122,7 +122,7 @@ async def refine_regen_stage(
                     image_mime=task.image_mime,
                     render_png=winner.rendered_png,
                     artifact_context={"kind": "coder_v1", "js_code": winner.js_code, "osd": None},
-                    seed_override=CRITIC_SEED_BASE + 100 * ci,
+                    seed_override=prompt_seed(task.seed, f"{task.stem}:refine:visual:{ci}"),
                     temperature_override=CRITIC_TEMPERATURE,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -138,7 +138,7 @@ async def refine_regen_stage(
                     image_mime=task.image_mime,
                     render_png=winner.rendered_png,
                     js_code=winner.js_code or "",
-                    seed=STRUCT_SEED_BASE + 100 * ci,
+                    seed=prompt_seed(task.seed, f"{task.stem}:refine:structural:{ci}"),
                     temperature=0.3 if ci == 0 else 0.7,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -151,7 +151,7 @@ async def refine_regen_stage(
         asyncio.gather(*[structural(ci) for ci in range(n_cand)]),
     )
 
-    # 2-3) ve lai + kiem + xoay + render (+ sua 1 lan neu hong): dung duong cua ung vien bracket
+    # 2-3) regenerate + check + orient + render (+ one fix on failure): the bracket-candidate path
     factory = _CandidateFactory(
         task,
         coder=coder,
@@ -169,6 +169,7 @@ async def refine_regen_stage(
         ensemble_temperature=0.0,
         seed_offset=seed_offset,
         orientation=orientation,
+        code_fix=code_fix,
     )
     await factory.embed_reference()
     old_digest = _code_digest(winner.js_code)
@@ -202,7 +203,7 @@ async def refine_regen_stage(
         if _code_digest(cand.js_code) == old_digest:
             cand.drop_reason = "identical_to_winner"
             return cand
-        raw = cand.js_code                       # _validate co the chen xoay -> ban sua loi phai nhan ma THO
+        raw = cand.js_code                       # _validate may inject a rotation -> the fix must see the RAW code
         await factory._validate(cand)
         if cand.drop_reason is not None and cand.drop_reason.split(":")[0] in ("checker", "renderer"):
             error = "; ".join((cand.js_errors or []) + (cand.render_errors or [])) or cand.drop_reason
@@ -227,37 +228,34 @@ async def refine_regen_stage(
     made = [c for c in cands if c is not None]
     live = [c for c in made if _is_live(c) and c.judge_white_views]
 
-    # 4) dau voi ban thang bracket: ban ve lai la A (trai), ban thang la B (phai)
+    # 4) duel the bracket winner: regeneration = A (left), winner = B (right); full S1 (no early stop)
+    async def duel(cand: Candidate):
+        ci = cand.k - REGEN_K_BASE
+        try:
+            async with sem_judge:
+                verdict = await judge.compare(
+                    task_id=task.stem,
+                    match_label=f"REFINE c{ci}-vs-k{winner.k}",
+                    reference_bytes=task.image_bytes,
+                    reference_mime=task.image_mime,
+                    render_a=cand.rendered_png,
+                    render_b=winner.rendered_png,
+                    white_views_a=cand.judge_white_views,
+                    white_views_b=winner.judge_white_views,
+                    gray_views_a=cand.judge_gray_views,
+                    gray_views_b=winner.judge_gray_views,
+                    embeddings_a=cand.judge_embeddings,
+                    embeddings_b=winner.judge_embeddings,
+                    early_stop=False,
+                )
+            return cand, verdict, s1_margin(verdict)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[REFINE] {task.stem} duel c{ci} failed: {type(exc).__name__}: {exc}")
+            return cand, None, None
+
     results: list = []
     if live:
         status[task.stem] = "refine:judge"
-        prompt_url = await judge.encode_reference(task.image_bytes, task.image_mime)
-        winner_views = await judge.encode_views(
-            grid=winner.rendered_png, white=winner.judge_white_views,
-            gray=winner.judge_gray_views, embeddings=winner.judge_embeddings,
-        )
-
-        async def duel(cand: Candidate):
-            ci = cand.k - REGEN_K_BASE
-            try:
-                views = await judge.encode_views(
-                    grid=cand.rendered_png, white=cand.judge_white_views,
-                    gray=cand.judge_gray_views, embeddings=cand.judge_embeddings,
-                )
-                async with sem_judge:
-                    verdict = await judge.compare(
-                        task_id=task.stem,
-                        match_label=f"REFINE c{ci}-vs-k{winner.k}",
-                        prompt_url=prompt_url,
-                        left_views=views,
-                        right_views=winner_views,
-                        early_stop=False,
-                    )
-                return cand, verdict, s1_margin(verdict)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[REFINE] {task.stem} duel c{ci} failed: {type(exc).__name__}: {exc}")
-                return cand, None, None
-
         results = await asyncio.gather(*[duel(c) for c in live])
 
     passing = []
@@ -275,7 +273,6 @@ async def refine_regen_stage(
         if not (_is_live(c) and c.judge_white_views):
             info["cands"].append({"c": c.k - REGEN_K_BASE, "dropped": c.drop_reason or "no judge views"})
 
-    # ban ve lai di kem bo xuat ung vien (k >= 1000) de doc lai sau
     task.candidates = list(task.candidates) + made
     old_k = winner.k
     if passing:

@@ -4,19 +4,19 @@ import asyncio
 import hashlib
 import time
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
 
 import httpx
 
-from config.settings import BracketConfig, OrientationConfig
+from config.settings import OrientationConfig
 from logger_config import logger
 from modules.scene_planner.schema import OSD
+from pipeline import code_fix as _code_fix
 from pipeline.orientation import orient_task
 from pipeline.task import Candidate, PipelineTask
 from utils.http import download_image
 
-if TYPE_CHECKING:
-    from modules.judge.schema import JudgeVerdict
+
+from pipeline.batch_stats import STATS
 
 
 class StageError(Exception):
@@ -202,18 +202,12 @@ def _is_live(cand: Candidate | None) -> bool:
     )
 
 
-def _is_tiebreak(decided_by: str) -> bool:
-    """True when the cascade ended in a draw and the embedding heuristic (or its 'A' fallback) picked the winner."""
-    return "tie-break" in decided_by or "draw ->" in decided_by
-
-
 async def _resolve_bracket(
     *,
     task: PipelineTask,
     leaf_tasks: dict[int, asyncio.Task],
     judge,
     sem_judge: asyncio.Semaphore,
-    bracket: BracketConfig,
 ) -> Candidate | None:
     """Streaming single-elimination over fixed candidate positions.
 
@@ -222,238 +216,58 @@ async def _resolve_bracket(
     A duel fires the moment both of its subtree winners are known, so judging
     overlaps rendering. Pairing is by position, independent of which candidates
     drop, so the outcome is reproducible under a fixed seed.
-
-    `bracket` switches on the experimental variants (top-4 round-robin, tie-break
-    confirmation, similarity logging); all off is the plain elimination.
     """
 
-    async def _prepare(left: Candidate, right: Candidate) -> float:
-        """Base64-encode the reference and any side not yet encoded; returns seconds spent."""
-        t0 = time.monotonic()
-        if task.judge_ref_url is None:
-            task.judge_ref_url = await judge.encode_reference(task.image_bytes, task.image_mime)
-        pending = [c for c in (left, right) if c.judge_views is None]
-        encoded = await asyncio.gather(*(
-            judge.encode_views(
-                grid=c.rendered_png, white=c.judge_white_views,
-                gray=c.judge_gray_views, embeddings=c.judge_embeddings,
-            )
-            for c in pending
-        ))
-        for cand, views in zip(pending, encoded):
-            cand.judge_views = views
-        return time.monotonic() - t0
-
-    def _release(*cands: Candidate) -> None:
-        for cand in cands:
-            cand.judge_views = None
-
-    async def _judge_duel(
-        left: Candidate, right: Candidate, label: str, *, s1_temperature: float = 0.0, early_stop: bool = False
-    ) -> tuple[Candidate, "JudgeVerdict"]:
-        """Compare two live candidates head-to-head; records the duel in task.meta["judge_duels"]."""
-        enc_s = await _prepare(left, right)
+    async def _judge_duel(left: Candidate, right: Candidate, round_no: int) -> Candidate:
+        """Compare two live candidates head-to-head and return the winner."""
+        label = f"R{round_no} k{left.k}-vs-k{right.k}"
         _t_q = time.monotonic()
         async with sem_judge:
             _t_s = time.monotonic()
             verdict = await judge.compare(
                 task_id=task.stem,
                 match_label=label,
-                prompt_url=task.judge_ref_url,
-                left_views=left.judge_views,
-                right_views=right.judge_views,
-                s1_temperature=s1_temperature,
-                early_stop=early_stop,
+                reference_bytes=task.image_bytes,
+                reference_mime=task.image_mime,
+                render_a=left.rendered_png,
+                render_b=right.rendered_png,
+                white_views_a=left.judge_white_views,
+                white_views_b=right.judge_white_views,
+                gray_views_a=left.judge_gray_views,
+                gray_views_b=right.judge_gray_views,
+                embeddings_a=left.judge_embeddings,
+                embeddings_b=right.judge_embeddings,
+                early_stop=judge.early_stop_for_round(round_no),
             )
         winner = left if verdict.winner == "A" else right
         _t_e = time.monotonic()
-        record: dict = {
-            "label": label, "decided_by": verdict.decided_by, "winner_k": winner.k,
-            "queue_s": round(_t_s - _t_q, 2), "compare_s": round(_t_e - _t_s, 2),
-            "detail": verdict.detail,
-            "early_stopped": (verdict.detail.get("s1_slim") or {}).get("early_stopped", 0),
-        }
-        extra = ""
-        if bracket.log_similarity:
-            sim_a, sim_b = await asyncio.gather(
-                judge.similarity(left.judge_views), judge.similarity(right.judge_views)
-            )
-            record.update({"sim_a": sim_a, "sim_b": sim_b})
-            if sim_a is not None and sim_b is not None and sim_a != sim_b:
-                higher_won = (left if sim_a > sim_b else right) is winner
-                record["higher_sim_won"] = higher_won
-                extra = f" | simA={sim_a:.3f} simB={sim_b:.3f} higher_sim_won={higher_won}"
-        task.meta.setdefault("judge_duels", []).append(record)
+        STATS.duel(_t_e - _t_s, _t_s - _t_q)
         logger.info(
             f"[BRACKET {label}] {task.stem} -> k{winner.k} | "
-            f"[JUDGE_TIMING] encode={enc_s * 1000:.0f}ms queue_wait={_t_s - _t_q:.1f}s "
-            f"compare={_t_e - _t_s:.1f}s in_flight={sem_judge._value}{extra}"
+            f"[JUDGE_TIMING] queue_wait={_t_s - _t_q:.1f}s compare={_t_e - _t_s:.1f}s in_flight={sem_judge._value}"
         )
-        return winner, verdict
+        return winner
 
-    async def _node(lo: int, hi: int) -> Candidate | None:
+    async def _winner_of(lo: int, hi: int) -> Candidate | None:
         """Winner of candidate positions [lo, hi): one leaf, or the better half."""
         if hi - lo <= 1:
             return await leaf_tasks[lo]
 
         mid = (lo + hi) // 2
-        left, right = await asyncio.gather(_node(lo, mid), _node(mid, hi))
+        left, right = await asyncio.gather(_winner_of(lo, mid), _winner_of(mid, hi))
 
-        # A half with no live candidate is a walkover: the other side advances free.
+        # A half with no live candidate is a walkover — the other side advances free.
         if not _is_live(left):
             return right
         if not _is_live(right):
             return left
 
         round_no = (hi - lo - 1).bit_length()  # R1 = first-round pair, then upward
-        winner, _ = await _judge_duel(
-            left, right, f"R{round_no} k{left.k}-vs-k{right.k}", early_stop=judge.early_stop_for_round(round_no)
-        )
-        _release(right if winner is left else left)
-        return winner
+        return await _judge_duel(left, right, round_no)
 
-    async def _final(n: int) -> Candidate | None:
-        """Root of the elimination, plus the optional tie-break confirmation."""
-        mid = n // 2
-        left, right = await asyncio.gather(_node(0, mid), _node(mid, n))
-        if not _is_live(left):
-            return right
-        if not _is_live(right):
-            return left
-
-        task.meta["bracket_top"] = [left.k, right.k]
-        round_no = (n - 1).bit_length()
-        winner, verdict = await _judge_duel(left, right, f"R{round_no} k{left.k}-vs-k{right.k}")
-        if bracket.tiebreak_confirmation and _is_tiebreak(verdict.decided_by):
-            confirmed, cverdict = await _judge_duel(
-                right, left, f"R{round_no}c k{right.k}-vs-k{left.k}",
-                s1_temperature=bracket.tiebreak_temperature,
-            )
-            logger.info(
-                f"[BRACKET CONFIRM] {task.stem} tie-break k{winner.k} -> "
-                f"{'kept' if confirmed is winner else 'overturned'} k{confirmed.k} ({cverdict.decided_by})"
-            )
-            task.meta["bracket_confirm"] = {
-                "tiebreak_winner_k": winner.k, "confirmed_k": confirmed.k, "decided_by": cverdict.decided_by,
-            }
-            winner = confirmed
-        _release(left, right)
-        return winner
-
-    def _elimination_from(quarters: list[Candidate | None], beats: dict[tuple[int, int], int]) -> Candidate:
-        """What plain elimination would have returned, replayed from the round-robin results."""
-        def duel(a: Candidate | None, b: Candidate | None) -> Candidate | None:
-            if not _is_live(a):
-                return b
-            if not _is_live(b):
-                return a
-            return a if beats[(a.k, b.k)] == a.k else b
-        return duel(duel(quarters[0], quarters[1]), duel(quarters[2], quarters[3]))
-
-    async def _round_robin_final(n: int) -> Candidate | None:
-        """Top-4 round-robin over the quarter winners: six concurrent duels replace the two last rounds."""
-        mid = n // 2
-        bounds = [(0, mid // 2), (mid // 2, mid), (mid, mid + (n - mid) // 2), (mid + (n - mid) // 2, n)]
-        quarters = list(await asyncio.gather(*(_node(lo, hi) for lo, hi in bounds)))
-        live = [c for c in quarters if _is_live(c)]
-        if len(live) < 2:
-            return live[0] if live else None
-
-        task.meta["bracket_top"] = [c.k for c in live]
-        pairs = [(a, b) for i, a in enumerate(live) for b in live[i + 1:]]
-        results = await asyncio.gather(*(_judge_duel(a, b, f"RR k{a.k}-vs-k{b.k}") for a, b in pairs))
-        wins = {c.k: 0 for c in live}
-        beats: dict[tuple[int, int], int] = {}
-        for (a, b), (w, _) in zip(pairs, results):
-            beats[(a.k, b.k)] = beats[(b.k, a.k)] = w.k
-            wins[w.k] += 1
-
-        top = [c for c in live if wins[c.k] == max(wins.values())]
-        if len(top) == 1:
-            winner = top[0]
-        elif len(top) == 2:
-            winner = top[0] if beats[(top[0].k, top[1].k)] == top[0].k else top[1]
-        else:
-            sims = await asyncio.gather(*(judge.similarity(c.judge_views) for c in top))
-            winner = min(zip(top, sims), key=lambda cs: (-(cs[1] if cs[1] is not None else -1.0), cs[0].k))[0]
-
-        elim = _elimination_from(quarters, beats)
-        cycle = max(wins.values()) < len(live) - 1
-        logger.info(
-            f"[BRACKET RR] {task.stem} top={[c.k for c in live]} wins={wins} -> k{winner.k} | "
-            f"elimination -> k{elim.k} agree={elim is winner} cycle={cycle}"
-        )
-        task.meta["bracket_rr"] = {
-            "top": [c.k for c in live], "wins": wins, "rr_winner_k": winner.k,
-            "elim_winner_k": elim.k, "agree": elim is winner, "cycle": cycle,
-        }
-        _release(*live)
-        return winner
-
-    n = len(leaf_tasks)
-    if n == 0:
+    if not leaf_tasks:
         return None
-    if n == 1:
-        return await leaf_tasks[0]
-    if bracket.final_round_robin and n >= 8:
-        return await _round_robin_final(n)
-    return await _final(n)
-
-
-async def _prefilter_scores(embedder, task: PipelineTask, live: list[Candidate]) -> dict[int, float]:
-    """Diem DINOv3 (crop 448, TB 2 goc truoc tot nhat) cho moi ung vien song; {} khi DINO tat hoac loi."""
-    if embedder is None or not hasattr(embedder, "prefilter_scores") or not live or not task.image_bytes:
-        return {}
-    try:
-        return await embedder.prefilter_scores(
-            task.image_bytes, {c.k: (c.judge_white_views or {}) for c in live}
-        )
-    except Exception as exc:  # noqa: BLE001 - loc truoc khong bao gio lam hong de
-        logger.warning(f"[PREFILTER] {task.stem} scoring failed: {type(exc).__name__}: {exc}")
-        return {}
-
-
-def _completed(cand: Candidate | None) -> asyncio.Future:
-    fut = asyncio.get_running_loop().create_future()
-    fut.set_result(cand)
-    return fut
-
-
-async def _prefilter_bracket(
-    *,
-    task: PipelineTask,
-    leaf_tasks: dict[int, asyncio.Task],
-    embedder,
-    judge,
-    sem_judge: asyncio.Semaphore,
-    bracket: BracketConfig,
-    keep: int,
-) -> Candidate | None:
-    """Loc truoc bang DINOv3 roi dau loai tren `keep` ban giong anh de nhat.
-
-    Cho du ung vien, xep hang theo diem DINO, giu `keep` ban (xep lai theo k de vi tri bracket tai lap duoc)
-    va chay dung `_resolve_bracket` tren cac ban giu. DINO tat/loi hoac khong du ban -> dau tren moi ban song.
-    """
-    leaves = await asyncio.gather(*leaf_tasks.values())
-    live = [c for c in leaves if _is_live(c)]
-    scores = await _prefilter_scores(embedder, task, live) if len(live) > keep else {}
-    if scores:
-        ranked = sorted(live, key=lambda c: (-scores.get(c.k, float("-inf")), c.k))
-        kept = sorted(ranked[:keep], key=lambda c: c.k)
-    else:
-        kept = sorted(live, key=lambda c: c.k)
-    task.meta["prefilter"] = {
-        "keep": keep, "live": len(live), "kept": [c.k for c in kept], "scored": bool(scores),
-        "scores": {k: round(v, 4) for k, v in scores.items()},
-    }
-    logger.info(
-        f"[PREFILTER] {task.stem} live={len(live)} -> kept={len(kept)} "
-        f"({'DINOv3' if scores else 'khong loc'}) | kept_k={[c.k for c in kept]}"
-    )
-    done = {i: _completed(c) for i, c in enumerate(kept)}
-    return await _resolve_bracket(
-        task=task, leaf_tasks=done, judge=judge, sem_judge=sem_judge, bracket=bracket,
-    )
+    return await _winner_of(0, len(leaf_tasks))
 
 
 def _promote_winner(
@@ -469,8 +283,6 @@ def _promote_winner(
     task.js_errors = list(winner.js_errors)
     task.scene_json = winner.scene_json
     task.rendered_png = winner.rendered_png
-    winner.judge_views = None
-    task.judge_ref_url = None
 
     # Rename the winner's coder session to the canonical actor so downstream
     # repair stages find it; evict the losers to free memory.
@@ -510,12 +322,18 @@ class _CandidateFactory:
         checker_mode: str,
         ensemble_temperature: float,
         seed_offset: int = 0,
-        log_similarity: bool = False,
         orientation: OrientationConfig | None = None,
+        candidate_deadline_s: float = 0.0,
+        code_fix: bool = False,
     ) -> None:
         self.task = task
+        self.code_fix = code_fix
         self.seed_offset = seed_offset
-        self.log_similarity = log_similarity
+        self.orientation = orientation or OrientationConfig()
+        # Absolute monotonic-free deadline: task.started_at is time.time() set by the orchestrator.
+        self.candidate_deadline_at = (
+            (task.started_at or time.time()) + candidate_deadline_s if candidate_deadline_s > 0 else None
+        )
         self.coder = coder
         self.judge = judge
         self.embedder = embedder
@@ -529,7 +347,6 @@ class _CandidateFactory:
         self.send_image = send_image
         self.checker_mode = checker_mode
         self.ensemble_temperature = ensemble_temperature
-        self.orientation = orientation or OrientationConfig()
         self.ref_vec = None
         self._coder_tasks: dict[int, asyncio.Task] = {}
 
@@ -554,6 +371,16 @@ class _CandidateFactory:
         digest = _code_digest(cand.js_code)
         if digest is None:
             return None  # coder failed -> walkover (drop_reason already set)
+
+        # Cheap early fold: an EARLIER candidate that has ALREADY finished with byte-identical code means this one
+        # is a duplicate whatever the full scan finds, so skip checker/render entirely. Never waits on an
+        # unfinished coder (that would bunch validation at the end of the batch), so the outcome is exactly the
+        # full scan's below.
+        for j in range(k):
+            t = self._coder_tasks[j]
+            if t.done() and not t.cancelled() and t.exception() is None and _code_digest(t.result().js_code) == digest:
+                cand.drop_reason = f"duplicate_of_k{j}"
+                return None
 
         # The dedup scan awaits every earlier coder, so candidate k is gated by the
         # slowest of 0..k-1 — the higher k, the longer the stall. Validation
@@ -580,17 +407,30 @@ class _CandidateFactory:
         task = self.task
         cand = Candidate(k=k, seed=task.seed + self.seed_offset + k)
         t0 = time.time()
+        # Remaining wall-clock for this candidate, semaphore wait included: a candidate that
+        # cannot even start before the deadline is a walkover, so the bracket never waits on
+        # a wedged coder past candidate_deadline_s. None = unbounded (old behaviour).
+        remaining = None
+        if self.candidate_deadline_at is not None:
+            remaining = max(0.0, self.candidate_deadline_at - time.time())
         try:
-            async with stage_guard(task, f"coder#k{k}", self.sem_coder, self.status):
-                cand.js_code = await self.coder.code(
-                    task_id=task.stem,
-                    osd=self.osd,
-                    image_bytes=task.image_bytes if self.send_image else None,
-                    image_mime=task.image_mime,
-                    actor_override=f"coder#k{k}",
-                    seed_override=cand.seed,
-                    temperature_override=self.ensemble_temperature,
-                )
+            async with asyncio.timeout(remaining):
+                async with stage_guard(task, f"coder#k{k}", self.sem_coder, self.status):
+                    cand.js_code = await self.coder.code(
+                        task_id=task.stem,
+                        osd=self.osd,
+                        image_bytes=task.image_bytes if self.send_image else None,
+                        image_mime=task.image_mime,
+                        actor_override=f"coder#k{k}",
+                        seed_override=cand.seed,
+                        temperature_override=self.ensemble_temperature,
+                    )
+        except TimeoutError:
+            cand.drop_reason = "coder:deadline"
+            logger.warning(
+                f"[CANDIDATE DEADLINE] {task.stem} k{k} dropped after {time.time() - t0:.0f}s "
+                f"(candidate_deadline_s elapsed)"
+            )
         except StageError as exc:
             cand.drop_reason = f"coder:{type(exc.cause).__name__}"
         except Exception as exc:
@@ -614,6 +454,13 @@ class _CandidateFactory:
                 cand.drop_reason = f"checker:{type(exc).__name__}"
                 cand.elapsed_s += time.time() - t0
                 return
+        if not shadow.js_valid and self.code_fix:
+            used = await self._try_code_fix(shadow)
+            if used:
+                task.meta.setdefault("code_fix", {})[cand.k] = {"rules": used, "passed": bool(shadow.js_valid)}
+                logger.info(f"[CODE_FIX] {task.stem} k{cand.k} rules={used} -> {'passed' if shadow.js_valid else 'still failing'}")
+                if shadow.js_valid:
+                    cand.js_code = shadow.js_code
         cand.js_valid = shadow.js_valid
         cand.js_errors = list(shadow.js_errors or [])
         cand.scene_json = shadow.scene_json
@@ -623,21 +470,14 @@ class _CandidateFactory:
             return
         if self.orientation.enabled:
             result = await orient_task(
-                shadow,
-                renderer=self.renderer,
-                embedder=self.embedder,
-                ref_vec=self.ref_vec,
-                js_checker=self.js_checker,
-                checker_mode=self.checker_mode,
-                config=self.orientation,
-                sem_render=self.sem_renderer,
-                sem_check=self.sem_checker,
+                shadow, renderer=self.renderer, embedder=self.embedder, ref_vec=self.ref_vec,
+                js_checker=self.js_checker, checker_mode=self.checker_mode, config=self.orientation,
+                sem_render=self.sem_renderer, sem_check=self.sem_checker,
             )
             task.meta.setdefault("orientation", {})[cand.k] = result.model_dump(mode="json")
             if result.applied:
                 cand.js_code = shadow.js_code
                 cand.scene_json = shadow.scene_json
-
         judge_views_wanted = (
             self.judge is not None
             and getattr(self.renderer, "config", None) is not None
@@ -646,19 +486,16 @@ class _CandidateFactory:
         )
         white: dict = {}
         gray: dict = {}
-        # The renderer holds sem_renderer only around the sidecar request; decoding
-        # and grid composition run after the slot is released.
-        try:
-            if judge_views_wanted:
-                white, gray = await self.renderer.process_with_judge_views(
-                    shadow, slot=self.sem_renderer
-                )
-            else:
-                await self.renderer.process(shadow, slot=self.sem_renderer)
-        except Exception as exc:
-            cand.drop_reason = f"renderer:{type(exc).__name__}"
-            cand.elapsed_s += time.time() - t0
-            return
+        async with self.sem_renderer:
+            try:
+                if judge_views_wanted:
+                    white, gray = await self.renderer.process_with_judge_views(shadow)
+                else:
+                    await self.renderer.process(shadow)
+            except Exception as exc:
+                cand.drop_reason = f"renderer:{type(exc).__name__}"
+                cand.elapsed_s += time.time() - t0
+                return
         cand.rendered_png = shadow.rendered_png
         cand.render_errors = list(shadow.render_errors or [])
         if not shadow.rendered_png:
@@ -668,14 +505,36 @@ class _CandidateFactory:
         if cand.drop_reason is None and white:
             cand.judge_white_views, cand.judge_gray_views = white, gray
             if self.embedder is not None and self.ref_vec is not None:
-                cand.judge_embeddings = await self.embedder.build_candidate_embeddings(
+                cand.judge_embeddings = await self.embedder.build_candidate_npz(
                     self.ref_vec, cand.judge_white_views
                 )
-                if self.log_similarity and cand.judge_embeddings:
-                    self.task.meta.setdefault("candidate_sims", {})[cand.k] = (
-                        self.embedder.view_similarities(cand.judge_embeddings)
-                    )
 
+
+    async def _try_code_fix(self, shadow: PipelineTask, rounds: int = 4) -> list[str]:
+        """Rule-per-error repair of a checker failure, re-checking after each pass (the checker reports one
+        failure at a time). Leaves shadow checked: js_valid True on success. Any exception means "no fix"."""
+        used_all: list[str] = []
+        for _ in range(rounds):
+            failures = _code_fix.parse_errors(shadow.js_errors)
+            if not any(f["rule"] in _code_fix.FIXABLE_RULES for f in failures):
+                break
+            try:
+                new_code, used = _code_fix.fix_once(shadow.js_code or "", failures)
+            except Exception:  # noqa: BLE001 - a repair rule must never break validation
+                break
+            if not used:
+                break
+            used_all += used
+            shadow.js_code, shadow.js_valid, shadow.js_errors, shadow.scene_json = new_code, None, [], None
+            async with self.sem_checker:
+                try:
+                    await self.js_checker.process(shadow, mode=self.checker_mode)
+                except Exception:  # noqa: BLE001
+                    shadow.js_valid = False
+                    break
+            if shadow.js_valid:
+                break
+        return used_all
 
 async def multigen_first_iter(
     task: PipelineTask,
@@ -696,9 +555,9 @@ async def multigen_first_iter(
     ensemble_temperature: float,
     render_from_object: bool = False,
     seed_offset: int = 0,
-    bracket: BracketConfig | None = None,
     orientation: OrientationConfig | None = None,
-    prefilter_keep: int = 0,
+    candidate_deadline_s: float = 0.0,
+    code_fix: bool = False,
 ) -> None:
     """K-of-N generation + judge bracket. Replaces code_and_check + renderer
     on iteration 0 when `coder.ensemble_size > 1`.
@@ -710,7 +569,6 @@ async def multigen_first_iter(
     osd = OSD.model_validate_json(task.osd) if task.osd is not None else None
     send_image = (osd is None) or coder_multimodal
     K = ensemble_size
-    bracket = bracket or BracketConfig()
 
     logger.info(
         f"[MULTIGEN] {task.stem} K={K} | temperature={ensemble_temperature} | "
@@ -733,8 +591,9 @@ async def multigen_first_iter(
         checker_mode="with_object" if render_from_object else "sanity",
         ensemble_temperature=ensemble_temperature,
         seed_offset=seed_offset,
-        log_similarity=bracket.log_similarity,
         orientation=orientation,
+        candidate_deadline_s=candidate_deadline_s,
+        code_fix=code_fix,
     )
 
     # Launch every coder at once, then embed the reference while they run; each
@@ -750,15 +609,9 @@ async def multigen_first_iter(
     if judge is None or K <= 1:
         leaves = await asyncio.gather(*leaf_tasks.values())
         winner = next((c for c in leaves if _is_live(c)), None)
-    elif prefilter_keep > 0:
-        winner = await _prefilter_bracket(
-            task=task, leaf_tasks=leaf_tasks, embedder=embedder, judge=judge, sem_judge=sem_judge,
-            bracket=bracket, keep=prefilter_keep,
-        )
     else:
         winner = await _resolve_bracket(
             task=task, leaf_tasks=leaf_tasks, judge=judge, sem_judge=sem_judge,
-            bracket=bracket,
         )
 
     # Every leaf (hence every coder) has resolved by the time the bracket returns.

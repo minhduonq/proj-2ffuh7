@@ -6,11 +6,11 @@ VLLM_VERSION="${VLLM_VERSION:-0.23.0}"
 VLLM_CUDA_TAG="${VLLM_CUDA_TAG:-cu129}"
 MANYLINUX="${MANYLINUX:-manylinux_2_28}"
 TORCH_BACKEND="${TORCH_BACKEND:-cu128}"
-TRANSFORMERS_SPEC="${TRANSFORMERS_SPEC:-transformers==5.18.0}"
+TRANSFORMERS_SPEC="${TRANSFORMERS_SPEC:-transformers==5.17.0}"
 FASTAPI_SPEC="${FASTAPI_SPEC:-fastapi==0.136.3}"
 PIP_VERSION="${PIP_VERSION:-26.2.1}"
 UV_VERSION="${UV_VERSION:-0.12.20}"
-# Exact versions of every dependency, per vllm version (scripts/constraints-vllm-<version>.txt).
+# Exact versions of every dependency, per vllm version (frozen from a verified deploy).
 CONSTRAINTS="${CONSTRAINTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/constraints-vllm-${VLLM_VERSION}.txt}"
 MODEL="${MODEL:-zai-org/GLM-4.6V-Flash}"
 MODEL_REVISION="${MODEL_REVISION:-}"

@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, asdict, field
 
+# Legacy knobs kept for env compatibility; the bf16 benchmark below uses fixed shapes.
 MATRIX_SIZE = int(os.environ.get("BENCHMARK_MATRIX_SIZE", "8192"))
 DURATION_SEC = float(os.environ.get("BENCHMARK_DURATION_SEC", "3.0"))
 STREAM_GB = float(os.environ.get("BENCHMARK_STREAM_GB", "2.0"))
@@ -106,6 +107,14 @@ def resolve_vllm_gpu_config(
 
 
 # Benchmark
+#
+# Why these three numbers (measured 2026-09-05 on an H100 PCIe, 300 W vs 200 W power cap; real coder tok/s fell 22 %):
+#   - raw copy bandwidth did not move at all (1850 -> 1847 GB/s): a "GPU bandwidth" check passes a power-throttled host,
+#   - bf16 matmul TFLOPS fell 39 % (365 -> 222): reacts, but overshoots,
+#   - a decode-shaped GEMM that streams weights x[M,K] @ W[K,N] with M = running seqs x (MTP acceptance+1) brackets the real
+#     drop: M=48 -14 %, M=144 -33 %.  That is what a bandwidth/compute-bound decode step looks like, without any model download.
+# Thresholds are per GPU family (env override) and deliberately loose until calibrated on a healthy 4xH200 pod
+# (run `python -m modules.metrics.gpu` there and read the numbers).
 
 @dataclass
 class GPUBenchmarkResult:
@@ -119,6 +128,12 @@ class GPUBenchmarkResult:
     sm_clock_mhz: int | None
     passed: bool
     reasons: list[str] = field(default_factory=list)
+    # thermal state: idle temperature before the bench, temperature + throttle reasons sampled mid-matmul
+    temp_idle_c: int | None = None
+    temp_load_c: int | None = None
+    throttle: str = ""          # compact flags sampled under load: "thermal_sw", "thermal_hw", "hw_slowdown", "power_cap"
+    thermal_throttled: bool = False
+    # legacy alias so old log readers keep working
     @property
     def tflops(self) -> float:
         return self.tflops_bf16
@@ -128,13 +143,13 @@ def gpu_thresholds(gpu_name: str) -> tuple[float, float]:
     """(min bf16 TFLOPS, min M=48 weight-stream GB/s) for this GPU family; env overrides win."""
     name = (gpu_name or "").upper()
     if "H200" in name:
-        d = (530.0, 3000.0)
+        d = (530.0, 3000.0)     # healthy H200 SXM measured 2026-09-05 (4 GPUs x 3 restarts): 652-669 TFLOPS, stream48 3697-3739 GB/s -> ~-20 %
     elif "B200" in name:
         d = (600.0, 3000.0)
     elif "H100" in name:
-        d = (250.0, 1100.0)
+        d = (250.0, 1100.0)     # H100 PCIe @300 W: 365 TFLOPS, 1567 GB/s ; @200 W: 222 / 1347
     else:
-        d = (30.0, 0.0)
+        d = (30.0, 0.0)         # unknown family: legacy sanity only
     return (
         float(os.environ.get("BENCHMARK_MIN_TFLOPS", d[0])),
         float(os.environ.get("BENCHMARK_MIN_STREAM48_GBPS", d[1])),
@@ -164,6 +179,11 @@ def _benchmark_single_gpu(
     """bf16 matmul TFLOPS + decode-shaped weight-stream GB/s (M=48 / M=144) on one GPU."""
     import torch
 
+    # idle thermal state BEFORE any load: a broken cooler shows as a GPU that idles 30-50 C above its neighbours
+    # (pod C 2026-09-27: GPU 0 idle 67-81 C, GPUs 1-3 28-39 C; under load it sat at 86-93 C / 345 MHz / 25 % TFLOPS)
+    idle = _smi_query(gpu_id, "temperature.gpu")
+    temp_idle = int(float(idle[0])) if idle and idle[0].replace(".", "", 1).isdigit() else None
+
     torch.cuda.set_device(gpu_id)
     device = torch.device(f"cuda:{gpu_id}")
     gpu_name = torch.cuda.get_device_name(gpu_id)
@@ -176,19 +196,33 @@ def _benchmark_single_gpu(
     n_mat = max(2, int(stream_gb * 1024**3 // per_mat))
     Ws = [torch.randn(K, N, device=device, dtype=torch.bfloat16) for _ in range(n_mat)]
 
+    # 1. compute-bound: sustained bf16 matmul; sample clocks / temperature / throttle reasons once mid-loop, i.e.
+    #    UNDER load (a post-bench reading can already be relaxing). ~0.1 s of nvidia-smi is excluded from the timing.
     a, b = Ws[0], Ws[1]
     for _ in range(3):
         a @ b
     torch.cuda.synchronize(device)
     ops = 0
+    load_smi: list[str] | None = None
+    smi_cost = 0.0
     start = time.monotonic()
-    while time.monotonic() - start < duration_sec:
+    while time.monotonic() - start - smi_cost < duration_sec:
         a @ b
         torch.cuda.synchronize(device)
         ops += 1
-    elapsed = time.monotonic() - start
+        if load_smi is None and time.monotonic() - start > duration_sec / 2:
+            t_s = time.monotonic()
+            load_smi = _smi_query(
+                gpu_id,
+                "clocks.sm,temperature.gpu,clocks_throttle_reasons.sw_thermal_slowdown,"
+                "clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,"
+                "clocks_throttle_reasons.sw_power_cap",
+            )
+            smi_cost = time.monotonic() - t_s
+    elapsed = time.monotonic() - start - smi_cost
     tflops = round(ops * 2.0 * K * N * K / elapsed / 1e12, 1)
 
+    # 2. decode-shaped: stream all weights through x[M,K] @ W for M = 48 and 144
     def stream(M: int) -> float:
         x = torch.randn(M, K, device=device, dtype=torch.bfloat16)
         for W in Ws[:2]:
@@ -209,7 +243,19 @@ def _benchmark_single_gpu(
 
     smi = _smi_query(gpu_id, "power.limit,clocks.sm")
     power_limit = float(smi[0]) if smi and smi[0].replace(".", "", 1).isdigit() else None
-    sm_clock = int(float(smi[1])) if smi and len(smi) > 1 and smi[1].replace(".", "", 1).isdigit() else None
+    post_clock = int(float(smi[1])) if smi and len(smi) > 1 and smi[1].replace(".", "", 1).isdigit() else None
+
+    def _num(v: str | None) -> int | None:
+        return int(float(v)) if v and v.replace(".", "", 1).isdigit() else None
+    sm_clock = _num(load_smi[0]) if load_smi else post_clock          # under-load clock, post-bench fallback
+    temp_load = _num(load_smi[1]) if load_smi and len(load_smi) > 1 else None
+    flags = []
+    if load_smi and len(load_smi) >= 6:
+        for name, val in zip(("thermal_sw", "thermal_hw", "hw_slowdown", "power_cap"), load_smi[2:6]):
+            if val.lower().startswith("active"):
+                flags.append(name)
+    throttle = ",".join(flags)
+    thermal = any(f.startswith("thermal") for f in flags)
 
     min_tflops, min_s48 = gpu_thresholds(gpu_name)
     reasons = []
@@ -220,6 +266,24 @@ def _benchmark_single_gpu(
     min_power = float(os.environ.get("BENCHMARK_MIN_POWER_LIMIT_W", "600" if "H200" in gpu_name.upper() else "0"))
     if power_limit is not None and min_power > 0 and power_limit < min_power:
         reasons.append(f"power.limit {power_limit:.0f} W < {min_power:.0f}")
+    # Thermal gates (pod C 2026-09-27: a healthy H200 at its 700 W power cap still runs 1,400-1,500 MHz under matmul load, so
+    # "clock < 80 % of max" is NOT a criterion — the power cap is normal; a thermally throttled one sat at 345-495 MHz).
+    # Default only for the families we calibrated (H200/H100 SXM: 1,395-1,500 MHz under load at the power cap); other
+    # families (a shared, 500 W-capped B200 read 442 MHz) need an explicit BENCHMARK_MIN_SM_CLOCK_MHZ / preflight.min_sm_clock_mhz.
+    fam_default = "1000" if ("H200" in gpu_name.upper() or "H100" in gpu_name.upper()) else "0"
+    min_clock = float(os.environ.get("BENCHMARK_MIN_SM_CLOCK_MHZ", fam_default))
+    if sm_clock is not None and min_clock > 0 and sm_clock < min_clock:
+        reasons.append(f"sm clock under load {sm_clock} MHz < {min_clock:.0f}")
+    if thermal:
+        reasons.append(f"thermal slowdown active under load ({throttle}; {temp_load} C)")
+    max_idle = float(os.environ.get("BENCHMARK_MAX_IDLE_TEMP_C", "60"))
+    if temp_idle is not None and max_idle > 0 and temp_idle > max_idle:
+        reasons.append(f"idle temperature {temp_idle} C > {max_idle:.0f}")
+    # A failing cooler heats well past its neighbours during the short bench before the slowdown flag trips; healthy H100/H200
+    # SXM units read 42-57 C here.
+    max_load = float(os.environ.get("BENCHMARK_MAX_LOAD_TEMP_C", "75" if ("H200" in gpu_name.upper() or "H100" in gpu_name.upper()) else "0"))
+    if temp_load is not None and max_load > 0 and temp_load > max_load:
+        reasons.append(f"temperature under load {temp_load} C > {max_load:.0f}")
 
     del Ws, a, b
     torch.cuda.empty_cache()
@@ -227,6 +291,7 @@ def _benchmark_single_gpu(
         gpu_id=gpu_id, gpu_name=gpu_name, vram_gb=vram_gb, tflops_bf16=tflops,
         stream48_gbps=s48, stream144_gbps=s144, power_limit_w=power_limit, sm_clock_mhz=sm_clock,
         passed=not reasons, reasons=reasons,
+        temp_idle_c=temp_idle, temp_load_c=temp_load, throttle=throttle, thermal_throttled=thermal,
     )
 
 

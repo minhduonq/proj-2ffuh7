@@ -4,74 +4,21 @@ import asyncio
 import gc
 import time
 import os
-from pathlib import Path
 
 import httpx
 from openai import AsyncOpenAI
-from pydantic import BaseModel
 
 from config.settings import LLMClientConfig, SettingsConf
 from logger_config import logger
 from modules.js_checker.module import JSCheckerModule
 from modules.renderer.module import RendererModule
-from pipeline.candidate_export import write_dump
 from pipeline.factory import build_pipeline
+from pipeline.batch_stats import STATS
 from pipeline.orchestrator import Pipeline
 from pipeline.state import MinerState
 from pipeline.task import PipelineTask
 
 _PLACEHOLDER_KEYS = {"", "placeholder", "your-key-here", "sk-or-...", "changeme"}
-
-
-class JudgeBatchStats(BaseModel):
-    """Judge summary over one batch, from the per-duel records in task.meta["judge_duels"]."""
-    duels: int = 0
-    s1_decided: int = 0
-    s2_decided: int = 0
-    s3_decided: int = 0
-    s4_stepdown: int = 0
-    draws: int = 0
-    s1_early_stopped: int = 0
-    s1_requests_saved: int = 0
-    compare_mean_s: float = 0.0
-    compare_p90_s: float = 0.0
-    queue_mean_s: float = 0.0
-
-    def log_line(self) -> str:
-        n = max(self.duels, 1)
-        return (
-            f"[Batch judge] duels={self.duels} s1={100 * self.s1_decided / n:.0f}% s2={100 * self.s2_decided / n:.0f}% "
-            f"s3={100 * self.s3_decided / n:.0f}% s4_stepdown={self.s4_stepdown} draws={self.draws} "
-            f"s1_early={self.s1_early_stopped} (saved {self.s1_requests_saved} S1 requests) "
-            f"compare_mean={self.compare_mean_s:.1f}s p90={self.compare_p90_s:.1f}s queue_mean={self.queue_mean_s:.1f}s"
-        )
-
-
-def _judge_batch_stats(tasks) -> JudgeBatchStats:
-    duels = [d for t in tasks for d in (t.meta or {}).get("judge_duels", [])]
-    stats = JudgeBatchStats(duels=len(duels))
-    for d in duels:
-        by = str(d.get("decided_by", ""))
-        s1_slim = (d.get("detail") or {}).get("s1_slim") or {}
-        if s1_slim.get("early_stopped"):
-            stats.s1_early_stopped += 1
-            stats.s1_requests_saved += 2 * (4 - int(s1_slim.get("n_total", 4)))
-        if "tie-break" in by or "draw ->" in by:
-            stats.draws += 1
-        elif by.startswith("S4"):
-            stats.s4_stepdown += 1
-        elif by.startswith("S3"):
-            stats.s3_decided += 1
-        elif by.startswith("S2"):
-            stats.s2_decided += 1
-        elif by.startswith("S1"):
-            stats.s1_decided += 1
-    if duels:
-        compare = sorted(float(d.get("compare_s", 0.0)) for d in duels)
-        stats.compare_mean_s = sum(compare) / len(compare)
-        stats.compare_p90_s = compare[min(len(compare) - 1, int(0.9 * len(compare)))]
-        stats.queue_mean_s = sum(float(d.get("queue_s", 0.0)) for d in duels) / len(duels)
-    return stats
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0")
 
 
@@ -98,6 +45,38 @@ def _resolve_api_key(name: str, cfg: LLMClientConfig) -> str | None:
     return api_key
 
 
+def _instrument_client(name: str, client: AsyncOpenAI) -> None:
+    """Wrap `client.chat.completions.create` so every call (coder, judge, critic, probe) lands in STATS with its
+    latency and usage. Measurement only: a failure to install the wrapper just logs, and the wrapper re-raises
+    everything untouched (cancellations are not counted as errors)."""
+    try:
+        completions = client.chat.completions
+        orig = completions.create
+
+        async def create(*args, **kwargs):
+            t0 = time.monotonic()
+            ok = True
+            usage = None
+            record = True
+            try:
+                resp = await orig(*args, **kwargs)
+                usage = getattr(resp, "usage", None)
+                return resp
+            except asyncio.CancelledError:
+                record = False
+                raise
+            except Exception:
+                ok = False
+                raise
+            finally:
+                if record:
+                    STATS.llm_call(name, time.monotonic() - t0, usage, ok)
+
+        completions.create = create  # type: ignore[method-assign]
+    except Exception as exc:
+        logger.warning(f"[diag] could not instrument llm client {name}: {exc!r}")
+
+
 class GenerationPipeline:
     """Top-level pipeline driver. Constructed once per app lifecycle."""
 
@@ -110,6 +89,7 @@ class GenerationPipeline:
         self.renderer = RendererModule(settings.renderer)
 
         self._clients: dict[str, AsyncOpenAI] = {}
+        self._client_urls: dict[str, str] = {}
         self._http_client: httpx.AsyncClient | None = None
         self._pipeline: Pipeline | None = None
 
@@ -127,13 +107,26 @@ class GenerationPipeline:
             self._clients[name] = AsyncOpenAI(
                 base_url=cfg.base_url,
                 api_key=api_key,
-                timeout=httpx.Timeout(3600.0, connect=120.0),
+                # Per-endpoint read timeout (llm_clients.<name>.request_timeout_s). In-flight
+                # requests are capped by the actor worker semaphores, so this measures service
+                # time, not queue time; a hung vLLM request costs one candidate / one duel retry,
+                # not the prompt or the batch. Connect timeout 120 s so judge bursts retry.
+                timeout=httpx.Timeout(cfg.request_timeout_s, connect=120.0),
                 max_retries=0,
             )
             logger.info(
                 f"llm client ready | name={name} base_url={cfg.base_url} "
-                f"local={_is_local_endpoint(cfg.base_url)}"
+                f"local={_is_local_endpoint(cfg.base_url)} timeout={cfg.request_timeout_s:.0f}s"
             )
+            self._client_urls[name] = cfg.base_url
+            _instrument_client(name, self._clients[name])
+        actors = self.settings.actors
+        _roles: dict[str, str] = {}
+        for _c, _r in ((actors.planner.client, "planner"), (actors.critic.client, "critic"),
+                       (actors.judge.client, "judge"), (actors.coder.client, "coder")):  # shared client names: coder/judge win
+            if _c:
+                _roles[_c] = _r
+        STATS.set_roles(_roles)
         limits = httpx.Limits(max_connections=200, max_keepalive_connections=50)
         self._http_client = httpx.AsyncClient(timeout=30.0, limits=limits)
 
@@ -162,11 +155,7 @@ class GenerationPipeline:
         )
         logger.info(f"Critic: {actors.critic.client} | Model: {actors.critic.model}")
         if actors.coder.ensemble_size > 1:
-            logger.info(
-                f"Judge: {actors.judge.client} | Model: {actors.judge.model} | "
-                f"max_stage={actors.judge.max_stage.value} | s1_concurrency={actors.judge.s1_concurrency} | "
-                f"bracket={self.settings.pipeline.bracket.model_dump()}"
-            )
+            logger.info(f"Judge: {actors.judge.client} | Model: {actors.judge.model}")
         else:
             logger.info("Judge: DISABLED (ensemble_size=1)")
         logger.info(f"Iter cap: {eb.max_iter} | Deadline: {eb.task_deadline_s:.0f}s | Threshold: {eb.score_threshold:.2f}")
@@ -218,18 +207,17 @@ class GenerationPipeline:
             )
             
         budget = self.settings.pipeline.batch_time_budget
-        dump_root = self.settings.pipeline.candidate_dump_dir
-
-        batch_started_at = time.time()
+        batch_started_at = self.state.batch_started_at or time.time()
         for t in tasks:
             t.batch_started_at = batch_started_at
 
         async def run_one(task: PipelineTask) -> None:
             while True:
                 result = await (await self._pipeline.submit(task))
-                if dump_root and result.candidates:
-                    await self._dump_candidates(result, Path(dump_root))
-                if not result.failed or task.attempt >= 2:
+                # Three attempts per prompt: a missing module is scored as a loss. A deadline
+                # failure is not retried: the retry would start a full K-candidate run after
+                # task_deadline_s and could only end at the batch budget.
+                if not result.failed or task.attempt >= 2 or result.failure_stage == "deadline":
                     self.state.record_task(result)
                     return
                 task = PipelineTask(
@@ -239,8 +227,13 @@ class GenerationPipeline:
                 task.attempt = result.attempt + 1
                 logger.info(f"[Batch retry] {task.stem} | attempt={task.attempt}")
 
+        await self._diag_snapshot("start")
         try:
-            logger.info(f"[Batch starting] {len(tasks)} tasks | budget={budget:.0f}s")
+            logger.info(
+                f"[Batch starting] {len(tasks)} tasks | budget={budget:.0f}s "
+                f"(effective {budget - 120:.0f}s) | task_deadline={self.settings.event_bus.task_deadline_s:.0f}s "
+                f"| candidate_deadline={self.settings.pipeline.candidate_deadline_s:.0f}s"
+            )
             await asyncio.wait_for(
                 asyncio.gather(*(run_one(t) for t in tasks)),
                 timeout=budget-120,
@@ -259,30 +252,36 @@ class GenerationPipeline:
         except asyncio.CancelledError:
             raise
         finally:
+            STATS.end()
+            await self._diag_snapshot("end")
             self._cleanup_batch_memory("Batch")
             logger.info(
                 f"[Batch done] {len(self.state.results)} ok, "
-                f"{len(self.state.failed)} failed"
+                f"{len(self.state.failed)} failed | diag: {' '.join(STATS.header_parts())}"
             )
-            logger.info(_judge_batch_stats(self.state.tasks.values()).log_line())
-    
-    async def _dump_candidates(self, task: PipelineTask, root: Path) -> None:
-        """Persist every candidate of one task attempt (code, renders, judge inputs) for offline experiments."""
-        try:
-            out, count = await asyncio.to_thread(write_dump, task, root, self.state.batch_index)
-            logger.info(
-                f"[Candidate dump] {task.stem} attempt={task.attempt} -> {out} "
-                f"({len(task.candidates)} candidates, {count} files)"
-            )
-        except Exception as exc:
-            logger.warning(f"[Candidate dump] {task.stem} failed: {exc!r}")
 
+    async def _diag_snapshot(self, when: str) -> None:
+        """Batch-start / batch-end counters for the participant-diag header: local vLLM servers' /metrics + cgroup cpu.stat."""
+        try:
+            STATS.cgroup_snapshot(when)
+            if self._http_client is None:
+                return
+            local = [(n, u) for n, u in self._client_urls.items() if n in self._clients and _is_local_endpoint(u)]
+            if local:
+                await asyncio.wait_for(
+                    asyncio.gather(*(STATS.vllm_snapshot(n, u, when, self._http_client) for n, u in local),
+                                   return_exceptions=True),
+                    timeout=12.0,
+                )
+        except Exception as exc:
+            logger.debug(f"[diag] snapshot {when} skipped: {exc!r}")
+    
     async def run_coder_probe(self) -> float | None:
         """Measure the coder endpoint's aggregate output tok/s with `concurrency` text-only code requests.
 
         Returns tok/s (None when disabled / no client / every request failed). Records
         state.diag['probe_tps'] and friends. The batch wall-clock is coder tokens / tok/s, so this
-        number predicts whether the batch fits its time budget; the caller decides REPLACE vs continue.
+        number predicts the audit fit; the caller decides REPLACE vs continue.
         """
         cfg = self.settings.pipeline.coder_probe
         if not cfg.enabled:
@@ -311,6 +310,9 @@ class GenerationPipeline:
             usage = getattr(resp, "usage", None)
             return int(getattr(usage, "completion_tokens", 0) or 0)
 
+        # Untimed warm-up burst first (same shape as the timed one): on a fresh pod the first concurrent burst still
+        # pays FlashInfer/Triton JIT and CUDA-graph capture for the batch-48 shapes — a single small warm-up request
+        # was not enough (fresh pod: 2481 tok/s after a 64-token warm-up vs 3146 with a warm JIT cache; cold 2116).
         t_w = time.monotonic()
         try:
             warm = await asyncio.wait_for(
@@ -366,6 +368,8 @@ class GenerationPipeline:
             logger.info("[Warmup task cancelled]")
             raise
         except Exception as exc:
+            # Never fall through to READY on a failed warmup: the caller keeps the pod at
+            # warming_up and retries, which beats advertising a pod that cannot generate.
             logger.exception(f"[Warmup failed] {exc}")
             raise
         finally:

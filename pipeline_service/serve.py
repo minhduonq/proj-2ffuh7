@@ -14,7 +14,7 @@ from fastapi.responses import Response, StreamingResponse, FileResponse
 
 from config.settings import LLMClientConfig, settings
 from logger_config import logger
-from pipeline.candidate_export import build_manifest, build_zip
+from pipeline.batch_stats import STATS
 from pipeline.generation_pipeline import GenerationPipeline
 from pipeline.state import MinerState, MinerStatus
 from pipeline.task import PipelineTask
@@ -87,12 +87,20 @@ def _load_preflight_metrics() -> None:
     d["mem_gb"] = host.get("mem_gb")
     net = m.get("network") or {}
     d["net_mbps"] = net.get("download_mbps")
+    for k in ("dc", "geo", "asn", "org", "pod", "rp_cpus"):  # region + RunPod ids (preflight.region_info)
+        if host.get(k):
+            d[k] = host[k]
     if gpus:
         names = sorted({str(g.get("gpu_name", "?")).replace("NVIDIA ", "") for g in gpus})
         d["gpus"] = f"{len(gpus)}x{'/'.join(names)}"
         d["tflops"] = [g.get("tflops_bf16") for g in gpus]
         d["stream48"] = [g.get("stream48_gbps") for g in gpus]
         d["power_w"] = [g.get("power_limit_w") for g in gpus]
+        # thermal state per GPU from the preflight bench: sm clock under load, idle>load temperature, throttle flags
+        d["gpu_sm"] = [g.get("sm_clock_mhz") for g in gpus]
+        d["gpu_temp"] = "/".join(f"{g.get('temp_idle_c', '?')}>{g.get('temp_load_c', '?')}" for g in gpus)
+        d["gpu_thr"] = "/".join((g.get("throttle") or "-") for g in gpus)
+        d["gpu_bad"] = "".join("x" if not g.get("passed", True) else "." for g in gpus)
     logger.info(f"preflight metrics loaded: {d}")
 
 
@@ -109,6 +117,10 @@ def _diag_header() -> str:
         f"tflops={_lst(d.get('tflops'))}",
         f"stream48={_lst(d.get('stream48'))}",
         f"power={_lst(d.get('power_w'))}",
+        f"gsm={_lst(d.get('gpu_sm'))}",
+        f"gtemp={d.get('gpu_temp', '?')}",
+        f"gthr={d.get('gpu_thr', '?')}",
+        f"gbad={d.get('gpu_bad', '?')}",
         f"probe_tps={d.get('probe_tps', '?')}",
         f"cpu_quota={d.get('cpu_quota', '?')}/{d.get('nproc', '?')}",
         f"net={d.get('net_mbps', '?')}",
@@ -116,6 +128,9 @@ def _diag_header() -> str:
         f"wall={wall if wall is not None else '?'}",
         f"seed={state.seed}",
     ]
+    # where the pod runs (preflight.region_info) + the batch's three-axis accounting (pipeline.batch_stats)
+    parts += [f"{k}={d[k]}" for k in ("dc", "geo", "asn", "org", "pod", "rp_cpus") if d.get(k)]
+    parts += STATS.header_parts()
     line = "// miner-diag: " + " ".join(parts)
     return "".join(ch for ch in line if 32 <= ord(ch) < 127) + "\n"
 
@@ -235,6 +250,7 @@ async def results():
     return StreamingResponse(zip_buffer, media_type="application/zip")
 
 
+
 def _completed_task_view(t: PipelineTask) -> dict:
     osd_preview = (t.osd[:80] + "…") if t.osd and len(t.osd) > 80 else t.osd
     return {
@@ -341,44 +357,7 @@ async def debug_task(stem: str):
             "score_history": task.score_history,
         },
         "meta": task.meta,
-        "candidates_top": [
-            {"k": c.k, "seed": c.seed, "drop_reason": c.drop_reason, "js_code": c.js_code}
-            for c in (task.candidates or [])
-            if c.k in set(task.meta.get("bracket_top", []))
-        ],
     }
-def _completed_task(stem: str) -> PipelineTask:
-    task = state.tasks.get(stem)
-    if task is None:
-        if stem in state.batch_stems:
-            raise HTTPException(202, f"Task '{stem}' still in progress")
-        raise HTTPException(404, f"Task '{stem}' not found in current batch")
-    return task
-
-
-@app.get("/debug/tasks/{stem}/candidates")
-async def debug_task_candidates(stem: str):
-    """Every candidate of the task with its code inline (no renders); see pipeline/candidate_export.py."""
-    task = _completed_task(stem)
-    manifest = build_manifest(task, state.batch_index).model_dump()
-    code_by_k = {c.k: c.js_code for c in task.candidates}
-    for record in manifest["candidates"]:
-        record["js_code"] = code_by_k.get(record["k"])
-    return manifest
-
-
-@app.get("/debug/tasks/{stem}/candidates.zip")
-async def debug_task_candidates_zip(stem: str, renders: bool = True):
-    """Full candidate export as a zip: manifest, reference, k??.js and (renders=true) every judge view + embeddings."""
-    task = _completed_task(stem)
-    data = await asyncio.to_thread(build_zip, task, state.batch_index, renders=renders)
-    return Response(
-        content=data,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{stem}_candidates.zip"'},
-    )
-
-
 @app.get("/debug/logs")
 async def debug_logs():
     log_path = "logs/pipeline.log"
