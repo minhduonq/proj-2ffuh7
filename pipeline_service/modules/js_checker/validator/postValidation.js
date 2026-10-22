@@ -50,56 +50,7 @@ const MAP_PROPS = [
   'anisotropyMap',
 ];
 
-
-// Curved surfaces large enough to show facets must be resolved smoothly.
-// Opt-in via SEGMENT_FLOOR_CHECK=1 so the rule can be A/B'd against a control.
-//
-// Deliberately NOT a flat floor: ~2/3 of curved primitives in real modules are
-// sub-2%-of-frame details where a low segment count is correct and 32 segments
-// is wasted geometry. Only primitives at or above MIN_RADIUS are checked, in
-// world space (i.e. after the module's own fit-to-unit-cube normalization),
-// so the threshold means the same thing in every module.
-//
-// Each entry pairs a segment parameter with the radius IT actually resolves.
-// Torus is the trap: `radialSegments` resolves the small tube cross-section
-// while the large ring is resolved by `tubularSegments`.
-const SEGMENT_FLOOR_MIN_RADIUS = 0.15;
-
-const SEGMENT_FLOORS = {
-  CylinderGeometry: [['radialSegments', p => Math.max(p.radiusTop ?? 0, p.radiusBottom ?? 0), 32]],
-  ConeGeometry: [['radialSegments', p => p.radius ?? 0, 32]],
-  CircleGeometry: [['segments', p => p.radius ?? 0, 32]],
-  SphereGeometry: [['widthSegments', p => p.radius ?? 0, 32]],
-  RingGeometry: [['thetaSegments', p => p.outerRadius ?? 0, 32]],
-  TorusGeometry: [
-    ['radialSegments', p => p.tube ?? 0, 16],
-    ['tubularSegments', p => p.radius ?? 0, 32],
-  ],
-  TubeGeometry: [['radialSegments', p => p.radius ?? 0, 12]],
-};
-
-const _scratchScale = new THREE.Vector3();
-
-function collectSegmentFloorViolations(node, out) {
-  const geom = node.geometry;
-  const spec = geom && SEGMENT_FLOORS[geom.type];
-  const params = geom && geom.parameters;
-  if (!spec || !params) return;
-  node.getWorldScale(_scratchScale);
-  const scale = Math.max(_scratchScale.x, _scratchScale.y, _scratchScale.z);
-  for (const [param, radiusOf, floor] of spec) {
-    const segs = params[param];
-    const worldRadius = radiusOf(params) * scale;
-    if (typeof segs !== 'number' || !(worldRadius >= SEGMENT_FLOOR_MIN_RADIUS)) continue;
-    if (segs < floor) {
-      out.push(
-        `${node.name || geom.type} (${geom.type}.${param}=${segs}, radius ${worldRadius.toFixed(2)}) needs >= ${floor}`,
-      );
-    }
-  }
-}
-
-export function postValidate(root, options = {}) {
+export function postValidate(root) {
   const failures = [];
 
   if (root === null || root === undefined) {
@@ -153,12 +104,6 @@ export function postValidate(root, options = {}) {
   let textureBytes = 0;
   let cycleDetected = false;
   let depthExceeded = false;
-  // Read from options, never from `process`: this runs inside the sandbox,
-  // where `process` is a trapped global and touching it throws.
-  const segmentFloorCheck = options.segmentFloorCheck === true;
-  const segmentFloorViolations = [];
-  // World scales are read below, so make sure the matrices are current.
-  walkRoot.updateMatrixWorld(true);
 
   function walk(node, depth) {
     if (visited.has(node)) {
@@ -174,9 +119,6 @@ export function postValidate(root, options = {}) {
 
     if (node.isMesh || node.isLine || node.isPoints) {
       drawCalls++;
-      if (segmentFloorCheck && node.isMesh) {
-        collectSegmentFloorViolations(node, segmentFloorViolations);
-      }
 
       const geom = node.geometry;
       if (geom && geom.attributes && geom.attributes.position) {
@@ -300,17 +242,6 @@ export function postValidate(root, options = {}) {
         detail: `box [${fmt(box.min.x)}, ${fmt(box.min.y)}, ${fmt(box.min.z)}] to [${fmt(box.max.x)}, ${fmt(box.max.y)}, ${fmt(box.max.z)}]`,
       });
     }
-  }
-
-  if (segmentFloorViolations.length > 0) {
-    failures.push({
-      stage: 'post_validation',
-      rule: 'CURVED_SURFACE_TOO_COARSE',
-      detail:
-        `${segmentFloorViolations.length} large curved surface(s) are visibly ` +
-        `polygonal — raise only these segment counts, leave small details alone: ` +
-        segmentFloorViolations.slice(0, 12).join('; '),
-    });
   }
 
   return {

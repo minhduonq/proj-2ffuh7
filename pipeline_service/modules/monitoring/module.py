@@ -26,9 +26,7 @@ def _checker_worker(
             ) as s:
                 async with s.get(health_url) as resp:
                     return resp.status == 200
-        # The total timeout raises asyncio.TimeoutError, which is not a ClientError; uncaught, it
-        # killed this probe process and left the last result standing.
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except aiohttp.ClientError:
             return False
 
     async def _probe(client: AsyncOpenAI, health_url: str) -> ProbeResult:
@@ -37,6 +35,10 @@ def _checker_worker(
             return ProbeResult.down(model, "health check failed")
         try:
             served = {entry.id for entry in (await client.models.list()).data}
+            # Reachable is not the same as serving this model. An endpoint that serves a
+            # different one answers every generation with NotFoundError while the pod
+            # still reports healthy, so health has to mean that this model in particular
+            # is being served.
             if model not in served:
                 return ProbeResult.down(model, f"endpoint serves {sorted(served)}, not {model}")
             return ProbeResult.running(model)
@@ -54,10 +56,7 @@ def _checker_worker(
         client = AsyncOpenAI(base_url=settings.vllm_url, api_key=settings.vllm_api_key)
 
         while True:
-            try:
-                result = await _probe(client, health_url)
-            except Exception as e:
-                result = ProbeResult.down(settings.vllm_model_name, f"probe error: {e!r}")
+            result = await _probe(client, health_url)
             # drain stale, push latest — we only care about current state
             try:
                 while True:

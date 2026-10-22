@@ -8,17 +8,13 @@ import re
 import struct
 import zlib
 from collections import Counter
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 import httpx
 from openai import AsyncOpenAI
-from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 
 from logger_config import logger
-
-if TYPE_CHECKING:
-    from config.settings import S1EarlyStopConfig
 
 try:  
     import numpy as np  
@@ -276,6 +272,10 @@ class IssuesSummary(BaseModel):
     issues: str
 
 
+_STOP_ISSUES = __import__("os").environ.get("JUDGE_STOP_ISSUES", "0") == "1"   # [patch_loop] edit 7 (opt-in)
+_STOP_ISSUES_RE = re.compile(r'^\s*\{\s*"penalty_1"\s*:\s*(-?\d+)\s*,\s*"penalty_2"\s*:\s*(-?\d+)\s*,?\s*$')
+
+
 def _neutral_penalty() -> PenaltyResponse:
     return PenaltyResponse(penalty_1=5, penalty_2=5, issues=JSON_FAILED_MARKER)
 
@@ -457,6 +457,28 @@ def _s2cl_build_verify_user_prompt(checklist: PromptChecklist) -> str:
         f'{{"checks": [{checks_hint}], "main_object_correct": true | false}}'
     )
 
+_INFLIGHT = [0]   # [patch_loop] edit 12: judge chat calls in flight (this process)
+
+
+def _s2_ac_matters(bv_vote, bv_diff, cl_vote, cl_gap) -> bool:
+    """[patch_loop] edit 12: can the artifact-compare vote still change the S2 choice? (mirrors _s2_strong_voter_choice
+    + _s2_consensus as used in evaluate_duel)"""
+    if _s2_strong_voter_choice(bv_diff, cl_gap)[0] is not None:
+        return False
+    return len({_s2_consensus([bv_vote, v, cl_vote], S2_MIN_CONSENSUS)[0] for v in ("A", "B", None)}) > 1
+
+
+def _lazy_ac_on() -> bool:
+    env = __import__("os").environ
+    if env.get("JUDGE_LAZY_AC", "1") == "0":
+        return False
+    try:
+        idle = int(env.get("JUDGE_LAZY_AC_IDLE", "24"))
+    except ValueError:
+        idle = 24
+    return _INFLIGHT[0] >= idle
+
+
 async def _safe_chat_json(
     client: AsyncOpenAI,
     messages: list[dict],
@@ -480,7 +502,10 @@ async def _safe_chat_json(
     }
     for attempt in range(max_retries):
         temp = temperature if attempt == 0 else 0.1 + 0.05 * attempt
+        if attempt > 0 and (_rb := _S2CL_RETRIED.get()) is not None:   # [patch_loop] memo: not a first-attempt result
+            _rb["retried"] = True
         attempt_seed = seed + attempt + 100
+        _INFLIGHT[0] += 1   # [patch_loop] edit 12: judge load signal for the lazy artifact compare
         try:
             completion = await client.chat.completions.create(
                 model=model,
@@ -489,9 +514,14 @@ async def _safe_chat_json(
                 max_tokens=max_tokens,
                 response_format=response_format,
                 seed=attempt_seed,
+                **({"stop": ['"issues"']} if (_STOP_ISSUES and response_model is PenaltyResponse) else {}),
             )
             text = completion.choices[0].message.content or ""
             parsed = _parse_or_repair(text, response_model)
+            if parsed is None and _STOP_ISSUES and response_model is PenaltyResponse:   # [patch_loop] edit 7
+                _m = _STOP_ISSUES_RE.match(text)
+                if _m:
+                    parsed = PenaltyResponse(penalty_1=int(_m.group(1)), penalty_2=int(_m.group(2)), issues="")
             if parsed is not None:
                 if attempt > 0:
                     logger.info(f"{label}: JSON parsed on attempt {attempt + 1}/{max_retries}")
@@ -501,6 +531,8 @@ async def _safe_chat_json(
             last_err = exc
         except Exception as exc:
             last_err = exc
+        finally:
+            _INFLIGHT[0] -= 1
 
         logger.warning(
             f"{label}: attempt {attempt + 1}/{max_retries} failed: "
@@ -534,12 +566,8 @@ def _slim_s1(s1: dict, choice: str) -> dict:
         "choice": choice,
         "n_total": s1["n_total"],
         "n_consistent": s1["n_consistent"],
-        "early_stopped": s1.get("early_stopped", 0),
         "angles": [
-            {
-                "label": a["label"], "pen_a": a["pen_a"], "pen_b": a["pen_b"],
-                "ab": a["ab"], "ba": a["ba"], "contradictory": a["contradictory"],
-            }
+            {"label": a["label"], "pen_a": a["pen_a"], "pen_b": a["pen_b"]}
             for a in s1["angles"]
         ],
     }
@@ -617,31 +645,8 @@ def _s1_messages(prompt_url: str, left_url: str, right_url: str, angle_desc: str
     ]
 
 
-def _s1_reduce_angle(ab: PenaltyResponse, ba: PenaltyResponse, theta: int, phi: int, weight: float, label: str) -> dict:
-    pen_a_ab, pen_b_ab = ab.penalty_1, ab.penalty_2
-    pen_a_ba, pen_b_ba = ba.penalty_2, ba.penalty_1
-    diff_ab = pen_a_ab - pen_b_ab
-    diff_ba = pen_a_ba - pen_b_ba
-    json_failed = ab.issues == JSON_FAILED_MARKER or ba.issues == JSON_FAILED_MARKER
-    contradictory = json_failed or ((diff_ab > 0 and diff_ba < 0) or (diff_ab < 0 and diff_ba > 0))
-    return {
-        "theta": theta,
-        "phi": phi,
-        "weight": weight,
-        "label": label,
-        "ab": _strip_issues(ab),
-        "ba": _strip_issues(ba),
-        "pen_a": (pen_a_ab + pen_a_ba) / 2,
-        "pen_b": (pen_b_ab + pen_b_ba) / 2,
-        "diff_ab": diff_ab,
-        "diff_ba": diff_ba,
-        "contradictory": contradictory,
-        "json_failed": json_failed,
-    }
-
-
-def _s1_early_gate(angles: list[dict], cfg: "S1EarlyStopConfig") -> bool:
-    """True when the angles judged so far are consistent, same side and wide enough to settle the duel."""
+def _s1_early_gate(angles: list[dict], cfg: Any) -> bool:
+    """True when the angles judged so far are consistent, on the same side and wide enough to settle the duel."""
     if not angles or any(a["contradictory"] for a in angles):
         return False
     diffs = [a["pen_a"] - a["pen_b"] for a in angles]
@@ -649,7 +654,7 @@ def _s1_early_gate(angles: list[dict], cfg: "S1EarlyStopConfig") -> bool:
         return False
     if len(angles) == 1 and cfg.single_angle_min_gap > 0 and abs(diffs[0]) >= cfg.single_angle_min_gap:
         return True
-    return len(angles) >= cfg.angles.value and all(abs(d) >= cfg.min_gap for d in diffs)
+    return len(angles) >= cfg.angles and all(abs(d) >= cfg.min_gap for d in diffs)
 
 
 async def _s1_run(
@@ -660,10 +665,8 @@ async def _s1_run(
     left_views: ViewsAdapter,
     right_views: ViewsAdapter,
     seed: int,
-    temperature: float = 0.0,
-    early_stop: "S1EarlyStopConfig | None" = None,
+    early_stop: Any = None,
 ) -> dict:
-    """Stage 1: four front angles x both side orders; with `early_stop` the first angles go one at a time."""
     async def _ask(left_url: str, right_url: str, angle_desc: str) -> PenaltyResponse:
         async with sem:
             r = await _safe_chat_json(
@@ -673,19 +676,38 @@ async def _s1_run(
                 label="s1_prompt_match",
                 model=model,
                 seed=seed,
-                temperature=temperature,
+                temperature=0.0,
                 max_tokens=1024,
                 max_retries=5,
                 on_failure=_neutral_penalty(),
             )
             return cast(PenaltyResponse, r)
 
-    async def _angle(theta: int, phi: int, weight: float, label: str) -> dict:
+    async def _angle(_theta: int, _phi: int, weight: float, label: str) -> dict:
         a_url = left_views.white_url(label)
         b_url = right_views.white_url(label)
         desc = S1_ANGLE_DESC[label]
         ab, ba = await asyncio.gather(_ask(a_url, b_url, desc), _ask(b_url, a_url, desc))
-        return _s1_reduce_angle(ab, ba, theta, phi, weight, label)
+        pen_a_ab, pen_b_ab = ab.penalty_1, ab.penalty_2
+        pen_a_ba, pen_b_ba = ba.penalty_2, ba.penalty_1
+        diff_ab = pen_a_ab - pen_b_ab
+        diff_ba = pen_a_ba - pen_b_ba
+        json_failed = ab.issues == JSON_FAILED_MARKER or ba.issues == JSON_FAILED_MARKER
+        contradictory = json_failed or ((diff_ab > 0 and diff_ba < 0) or (diff_ab < 0 and diff_ba > 0))
+        return {
+            "theta": _theta,
+            "phi": _phi,
+            "weight": weight,
+            "label": label,
+            "ab": _strip_issues(ab),
+            "ba": _strip_issues(ba),
+            "pen_a": (pen_a_ab + pen_a_ba) / 2,
+            "pen_b": (pen_b_ab + pen_b_ba) / 2,
+            "diff_ab": diff_ab,
+            "diff_ba": diff_ba,
+            "contradictory": contradictory,
+            "json_failed": json_failed,
+        }
 
     order: list[tuple[int, int, float, str]] = []
     for angle in S1_ANGLES:
@@ -697,25 +719,25 @@ async def _s1_run(
     if not order:
         return {"angles": [], "n_total": 0, "n_contradictory": 0, "n_consistent": 0, "n_json_failed": 0, "early_stopped": 0}
 
-    results: list[dict] = []
+    angles: list[dict] = []
     early_stopped = 0
     if early_stop is not None and early_stop.enabled:
-        for angle in order[: early_stop.angles.value]:
-            results.append(await _angle(*angle))
-            if _s1_early_gate(results, early_stop):
-                early_stopped = len(results)
+        for angle in order[: early_stop.angles]:
+            angles.append(await _angle(*angle))
+            if _s1_early_gate(angles, early_stop):
+                early_stopped = len(angles)
                 break
-        if not early_stopped and len(results) < len(order):
-            results.extend(await asyncio.gather(*(_angle(*angle) for angle in order[len(results):])))
+        if not early_stopped and len(angles) < len(order):
+            angles.extend(await asyncio.gather(*(_angle(*angle) for angle in order[len(angles):])))
     else:
-        results = list(await asyncio.gather(*(_angle(*angle) for angle in order)))
+        angles = list(await asyncio.gather(*(_angle(*angle) for angle in order)))
 
     return {
-        "angles": results,
-        "n_total": len(results),
-        "n_contradictory": sum(1 for a in results if a["contradictory"]),
-        "n_consistent": sum(1 for a in results if not a["contradictory"]),
-        "n_json_failed": sum(1 for a in results if a["json_failed"]),
+        "angles": angles,
+        "n_total": len(angles),
+        "n_contradictory": sum(1 for a in angles if a["contradictory"]),
+        "n_consistent": sum(1 for a in angles if not a["contradictory"]),
+        "n_json_failed": sum(1 for a in angles if a["json_failed"]),
         "early_stopped": early_stopped,
     }
 
@@ -988,6 +1010,56 @@ async def _s2cl_verify(
     return cast(VerificationResult, r)
 
 
+_S2CL_MEMO: dict = {}   # [patch_loop] identical-request memo for the photo-only checklist + per-grid verify
+_S2CL_RETRIED = __import__("contextvars").ContextVar("_S2CL_RETRIED", default=None)   # set by _safe_chat_json
+
+
+async def _s2cl_memo(key, make):
+    """Only a first-attempt (temp 0, seed+100) result is shared: if the call needed a retry (re-sampled at temp > 0)
+    or failed, it is not cached and every caller that waited on it makes its own call, as the original does."""
+    fut = _S2CL_MEMO.get(key)
+    if fut is not None:
+        try:
+            res, retried = await asyncio.shield(fut)
+            if not retried:
+                return res
+        except Exception:
+            pass
+        return await make()
+    if len(_S2CL_MEMO) > 20000:
+        _S2CL_MEMO.clear()
+    box = {"retried": False}
+
+    async def run():
+        _S2CL_RETRIED.set(box)
+        res = await make()
+        return res, box["retried"]
+
+    fut = asyncio.ensure_future(run())
+    _S2CL_MEMO[key] = fut
+
+    def _done(f):
+        if (f.cancelled() or f.exception() is not None or f.result()[1]) and _S2CL_MEMO.get(key) is f:
+            del _S2CL_MEMO[key]
+    fut.add_done_callback(_done)
+    return (await asyncio.shield(fut))[0]
+
+
+_s2cl_decompose_orig = _s2cl_decompose
+_s2cl_verify_orig = _s2cl_verify
+
+
+async def _s2cl_decompose(vlm: AsyncOpenAI, model: str, prompt_url: str, seed: int) -> PromptChecklist:
+    key = ("d", model, len(prompt_url), hash(prompt_url), seed)
+    return await _s2cl_memo(key, lambda: _s2cl_decompose_orig(vlm, model, prompt_url, seed))
+
+
+async def _s2cl_verify(vlm: AsyncOpenAI, model: str, prompt_url: str, grid_url: str, checklist: PromptChecklist,
+                       seed: int) -> VerificationResult:
+    key = ("v", model, len(prompt_url), hash(prompt_url), len(grid_url), hash(grid_url), checklist.model_dump_json(), seed)
+    return await _s2cl_memo(key, lambda: _s2cl_verify_orig(vlm, model, prompt_url, grid_url, checklist, seed))
+
+
 def _s2cl_score(result: VerificationResult) -> int:
     base = sum(S2_CHECKLIST_MATCH_SCORES.get(c.match, 0) for c in result.checks)
     return base + (S2_CHECKLIST_MAIN_BONUS if result.main_object_correct else 0)
@@ -1160,7 +1232,63 @@ def _read_png_rgb(data: bytes) -> tuple[int, int, int, list[list[int]]]:
     return width, height, bytes_per_pixel, rows
 
 
-def _foreground_stats_py(rgb_pngs: list[bytes]) -> dict:
+def _foreground_stats(rgb_pngs: list[bytes]) -> dict:
+    """[patch_loop] numpy version of _foreground_stats_ref: same samples, same float64 arithmetic in the same order
+    (luma summed sequentially), so the returned stats are identical; non 8-bit RGB/RGBA PNGs use the original."""
+    try:
+        import io as _io
+        import numpy as _np
+        from PIL import Image as _Image
+        arrs = []
+        for data in rgb_pngs:
+            # [review fix] accept only what the original decoder accepts: 8-bit RGB/RGBA, non-interlaced IHDR first,
+            # and an IDAT stream that zlib.decompress (with adler32 check) inflates to at least the full image size.
+            if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR" or data[24] != 8 or data[25] not in (2, 6) or data[28] != 0:
+                return _foreground_stats_ref(rgb_pngs)
+            _w, _h = struct.unpack(">II", data[16:24])
+            _pos, _idat = 8, []
+            while _pos < len(data):
+                _n = struct.unpack(">I", data[_pos:_pos + 4])[0]; _t = data[_pos + 4:_pos + 8]
+                if _t == b"IDAT": _idat.append(data[_pos + 8:_pos + 8 + _n])
+                elif _t == b"IEND": break
+                _pos += 12 + _n
+            if len(zlib.decompress(b"".join(_idat))) < _h * (1 + _w * (3 if data[25] == 2 else 4)):
+                return _foreground_stats_ref(rgb_pngs)
+            im = _Image.open(_io.BytesIO(data))
+            if im.mode not in ("RGB", "RGBA"):
+                return _foreground_stats_ref(rgb_pngs)
+            im.load()
+            arrs.append(_np.asarray(im)[::S3_SAMPLE_STEP, ::S3_SAMPLE_STEP, :3].astype(_np.int64))
+    except Exception:
+        return _foreground_stats_ref(rgb_pngs)
+    foreground = pale = grayish = 0
+    luma_sum = 0.0
+    for a in arrs:
+        r, g, b = a[..., 0], a[..., 1], a[..., 2]
+        d = _np.maximum(_np.maximum(_np.abs(r - S3_BACKGROUND_RGB[0]), _np.abs(g - S3_BACKGROUND_RGB[1])),
+                        _np.abs(b - S3_BACKGROUND_RGB[2]))
+        m = d > S3_BACKGROUND_TOLERANCE
+        r, g, b = r[m], g[m], b[m]
+        max_c = _np.maximum(_np.maximum(r, g), b)
+        min_c = _np.minimum(_np.minimum(r, g), b)
+        sat = _np.where(max_c > 0, (max_c - min_c) / _np.where(max_c > 0, max_c, 1), 0.0)
+        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        foreground += int(m.sum())
+        for v in luma.tolist():
+            luma_sum += v
+        grayish += int((sat < S3_GRAYISH_SAT_MAX).sum())
+        pale += int(((luma > S3_PALE_LUMA_MIN) & (sat < S3_PALE_SAT_MAX)).sum())
+    if foreground == 0:
+        return {"foreground_samples": 0, "pale_fraction": 0.0, "grayish_fraction": 0.0, "mean_luma": 0.0}
+    return {
+        "foreground_samples": foreground,
+        "pale_fraction": pale / foreground,
+        "grayish_fraction": grayish / foreground,
+        "mean_luma": luma_sum / foreground,
+    }
+
+
+def _foreground_stats_ref(rgb_pngs: list[bytes]) -> dict:
     foreground = 0
     pale = 0
     grayish = 0
@@ -1189,52 +1317,6 @@ def _foreground_stats_py(rgb_pngs: list[bytes]) -> dict:
                     grayish += 1
                 if luma > S3_PALE_LUMA_MIN and saturation < S3_PALE_SAT_MAX:
                     pale += 1
-    if foreground == 0:
-        return {"foreground_samples": 0, "pale_fraction": 0.0, "grayish_fraction": 0.0, "mean_luma": 0.0}
-    return {
-        "foreground_samples": foreground,
-        "pale_fraction": pale / foreground,
-        "grayish_fraction": grayish / foreground,
-        "mean_luma": luma_sum / foreground,
-    }
-
-
-def _png_header(data: bytes) -> tuple[int, int]:
-    """(bit_depth, color_type) from the IHDR chunk; raises ValueError for non-PNG input."""
-    if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
-        raise ValueError("Not a PNG")
-    _, _, bit_depth, color_type, _, _, _ = struct.unpack(">IIBBBBB", data[16:29])
-    return bit_depth, color_type
-
-
-def _foreground_stats(rgb_pngs: list[bytes]) -> dict:
-    """Sampled foreground colour statistics of gray-background renders (the S3 gate).
-
-    Vectorised twin of `_foreground_stats_py` (same sampling, thresholds and integer ratios); blocking, so callers
-    run it in a worker thread.
-    """
-    if np is None:
-        return _foreground_stats_py(rgb_pngs)
-    foreground = pale = grayish = 0
-    luma_sum = 0.0
-    background = np.asarray(S3_BACKGROUND_RGB, dtype=np.int32)
-    for data in rgb_pngs:
-        bit_depth, color_type = _png_header(data)
-        if bit_depth != 8 or color_type not in (2, 6):
-            raise ValueError(f"Unsupported PNG: bit_depth={bit_depth}, color_type={color_type}")
-        with Image.open(io.BytesIO(data)) as img:
-            rgb = np.asarray(img.convert("RGB"))[::S3_SAMPLE_STEP, ::S3_SAMPLE_STEP].astype(np.int32)
-        px = rgb[np.abs(rgb - background).max(axis=-1) > S3_BACKGROUND_TOLERANCE]
-        if px.shape[0] == 0:
-            continue
-        max_c = px.max(axis=1)
-        min_c = px.min(axis=1)
-        saturation = np.where(max_c > 0, (max_c - min_c) / np.maximum(max_c, 1), 0.0)
-        luma = 0.2126 * px[:, 0] + 0.7152 * px[:, 1] + 0.0722 * px[:, 2]
-        foreground += int(px.shape[0])
-        grayish += int((saturation < S3_GRAYISH_SAT_MAX).sum())
-        pale += int(((luma > S3_PALE_LUMA_MIN) & (saturation < S3_PALE_SAT_MAX)).sum())
-        luma_sum += float(luma.sum())
     if foreground == 0:
         return {"foreground_samples": 0, "pale_fraction": 0.0, "grayish_fraction": 0.0, "mean_luma": 0.0}
     return {
@@ -1495,8 +1577,7 @@ async def evaluate_duel(
     model: str = MODEL,
     log_id: str = "",
     max_stage: int = 4,
-    s1_temperature: float = 0.0,
-    early_stop: "S1EarlyStopConfig | None" = None,
+    early_stop: Any = None,
 ) -> tuple[str, dict]:
     """Run the multi-stage pipeline up to `max_stage`. Returns (winner, detail).
 
@@ -1508,7 +1589,7 @@ async def evaluate_duel(
             for R&D quality scoring where you average `pen_a`/`pen_b` across angles.
         2 — S1 + S2 (three sub-judges).
         3 — S1 + S2 + S3 (gray rescue runs only if S2 was a draw).
-        4 — full pipeline including S4 side guard (default).
+        4 — full pipeline including S4 side guard (mainnet behaviour).
     """
     if not 1 <= max_stage <= 4:
         raise ValueError(f"max_stage must be 1-4, got {max_stage}")
@@ -1516,25 +1597,15 @@ async def evaluate_duel(
     detail: dict[str, Any] = {}
     duel_start = asyncio.get_running_loop().time()
 
-    embeds: tuple[dict | None, dict | None] | None = None
-
-    async def _embeddings() -> tuple[dict | None, dict | None]:
-        nonlocal embeds
-        if embeds is None:
-            embeds = tuple(await asyncio.gather(left_views.fetch_embeddings(), right_views.fetch_embeddings()))
-        return embeds
-
     explain_task = asyncio.create_task(
         _explain_run(vlm, model, prompt_data_url, left_views.grid_url(), right_views.grid_url(), seed)
     )
 
     # Stage 1
     t = asyncio.get_running_loop().time()
-    s1 = await _s1_run(
-        vlm, model, sem, prompt_data_url, left_views, right_views, seed, temperature=s1_temperature, early_stop=early_stop,
-    )
+    s1 = await _s1_run(vlm, model, sem, prompt_data_url, left_views, right_views, seed, early_stop=early_stop)
     if s1.get("early_stopped"):
-        logger.debug(f"{log_id}: S1 early stop after {s1['early_stopped']} angle(s)")
+        logger.info(f"{log_id}: S1 early stop after {s1['early_stopped']} angle(s)")
     s1_choice, s1_reason = _s1_aggregate(s1)
     detail["s1"] = {**s1, "choice": s1_choice, "reason": s1_reason}
     detail["s1_slim"] = _slim_s1(s1, s1_choice)
@@ -1560,15 +1631,29 @@ async def evaluate_duel(
 
     # Stage 2 — all three sub-judges in parallel
     async def _bv_with_embeddings() -> dict | None:
-        left_embeds, right_embeds = await _embeddings()
+        left_embeds, right_embeds = await asyncio.gather(
+            left_views.fetch_embeddings(),
+            right_views.fetch_embeddings(),
+        )
         return await _s2bv_run(vlm, model, prompt_data_url, left_views, right_views, left_embeds, right_embeds, seed)
 
     t = asyncio.get_running_loop().time()
-    bv, ac, cl = await asyncio.gather(
-        _bv_with_embeddings(),
-        _s2ac_run(vlm, model, prompt_data_url, left_views, right_views, seed),
-        _s2cl_run(vlm, model, prompt_data_url, left_views, right_views, seed),
-    )
+    if not _lazy_ac_on():
+        bv, ac, cl = await asyncio.gather(
+            _bv_with_embeddings(),
+            _s2ac_run(vlm, model, prompt_data_url, left_views, right_views, seed),
+            _s2cl_run(vlm, model, prompt_data_url, left_views, right_views, seed),
+        )
+    else:   # [patch_loop] edit 12: bv + cl first; ac only if it can still change the S2 choice
+        bv, cl = await asyncio.gather(
+            _bv_with_embeddings(),
+            _s2cl_run(vlm, model, prompt_data_url, left_views, right_views, seed),
+        )
+        if _s2_ac_matters(*_s2_penalty_vote(bv, S2_BV_MIN_GAP), *_s2_checklist_vote(cl, S2_CL_MIN_GAP)):
+            ac = await _s2ac_run(vlm, model, prompt_data_url, left_views, right_views, seed)
+        else:
+            ac = None
+            detail["s2_ac_skipped"] = True
 
     bv_vote, bv_diff = _s2_penalty_vote(bv, S2_BV_MIN_GAP)
     ac_vote, ac_diff = _s2_penalty_vote(ac, S2_AC_MIN_GAP)
@@ -1611,6 +1696,8 @@ async def evaluate_duel(
         "checklist": cl,
     }
     detail["s2_slim"] = _slim_s2(bv, ac, cl, strong_choice, s2_source)
+    if detail.get("s2_ac_skipped"):
+        detail["s2_slim"]["ac_skipped"] = True
 
     if max_stage < 3:
         detail["decided_by"] = s2_decided_by

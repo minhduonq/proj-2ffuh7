@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from logger_config import logger
@@ -20,14 +19,6 @@ class DinoEmbedder:
         self._device: str | None = None
         self._disabled = False
         self._load_lock = asyncio.Lock()
-        # Own executor: GPU-bound embeds would otherwise occupy asyncio's default
-        # pool and stall every short to_thread job queued behind them.
-        self._executor = ThreadPoolExecutor(
-            max_workers=max(1, config.workers), thread_name_prefix="dino"
-        )
-
-    async def _run(self, fn, *args) -> Any:
-        return await asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
 
     def _load_sync(self) -> bool:
         """Import deps + load the model on the calling thread. Returns success."""
@@ -79,7 +70,7 @@ class DinoEmbedder:
                 return True
             if self._disabled:
                 return False
-            ok = await self._run(self._load_sync)
+            ok = await asyncio.to_thread(self._load_sync)
             if not ok:
                 self._disabled = True
             return ok
@@ -104,75 +95,58 @@ class DinoEmbedder:
             vecs.append(pooled.detach().to("cpu").float().numpy())
         return self._np.concatenate(vecs, axis=0)
 
-    @staticmethod
-    def view_similarities(embeddings: bytes | None) -> dict[str, float]:
-        """Cosine similarity of every `view_<name>` vector in a candidate npz to its `prompt` vector."""
-        if not embeddings:
-            return {}
-        import numpy as np
-
-        with np.load(io.BytesIO(embeddings)) as data:
-            prompt = data["prompt"]
-            return {
-                key[len("view_"):]: round(float(np.dot(data[key], prompt)), 4)
-                for key in data.files
-                if key.startswith("view_")
-            }
-
-    @staticmethod
-    def similarities(ref_vec: Any | None, vecs: dict[str, Any]) -> dict[str, float]:
-        """Cosine similarity of in-memory view vectors to the reference vector."""
-        if ref_vec is None or not vecs:
-            return {}
-        import numpy as np
-
-        return {name: round(float(np.dot(v, ref_vec)), 4) for name, v in vecs.items()}
-
     async def embed_reference(self, image: bytes) -> Any | None:
         """Embed the reference image. Returns an opaque vector or None if disabled."""
         if not image or not await self._ensure_loaded():
             return None
         try:
-            arr = await self._run(self._embed_sync, [image])
+            arr = await asyncio.to_thread(self._embed_sync, [image])
             return arr[0]
         except Exception as exc:  
             logger.warning(f"[DINO] reference embedding failed: {exc!r}")
             return None
 
     async def embed_views(self, views: dict[str, bytes]) -> dict[str, Any] | None:
-        """Embed rendered views into in-memory vectors keyed by view name.
-
-        Returns None when the embedder is disabled or nothing embeddable was given.
-        """
+        """Embed rendered views into in-memory vectors keyed by view name (orientation probe).
+        None when the embedder is disabled or nothing embeddable was given."""
         if not views or not await self._ensure_loaded():
             return None
         names = [n for n, b in views.items() if b]
         if not names:
             return None
         try:
-            arr = await self._run(self._embed_sync, [views[n] for n in names])
-        except Exception as exc:  
+            arr = await asyncio.to_thread(self._embed_sync, [views[n] for n in names])
+        except Exception as exc:
             logger.warning(f"[DINO] view embedding failed: {exc!r}")
             return None
         return dict(zip(names, arr))
 
-    async def build_candidate_embeddings(
+    @staticmethod
+    def similarities(ref_vec: Any | None, vecs: dict[str, Any]) -> dict[str, float]:
+        """Cosine similarity of in-memory view vectors to the reference vector (vectors are L2-normalised)."""
+        if ref_vec is None or not vecs:
+            return {}
+        import numpy as np
+
+        return {name: round(float(np.dot(v, ref_vec)), 4) for name, v in vecs.items()}
+
+    async def build_candidate_npz(
         self, ref_vec: Any | None, views: dict[str, bytes]
     ) -> bytes | None:
-        """Embed candidate views and pack {prompt, view_<name>...} into npz bytes —
-        the transport format the judge and the candidate export read.
+        """Embed candidate views and pack {prompt, view_<name>...} into npz bytes.
 
         Returns None when the embedder is disabled, ``ref_vec`` is missing, or no
         views were rendered — the judge then runs S2BV-free.
         """
-        if ref_vec is None:
+        if ref_vec is None or not views or not await self._ensure_loaded():
             return None
-        vecs = await self.embed_views(views)
-        if not vecs:
+        names = [n for n, b in views.items() if b]
+        if not names:
             return None
         try:
+            arr = await asyncio.to_thread(self._embed_sync, [views[n] for n in names])
             payload = {"prompt": ref_vec}
-            for n, vec in vecs.items():
+            for n, vec in zip(names, arr):
                 payload[f"view_{n}"] = vec
             buf = io.BytesIO()
             self._np.savez(buf, **payload)

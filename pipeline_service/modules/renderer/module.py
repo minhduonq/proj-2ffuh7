@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import os
 import random
 import signal
@@ -16,6 +15,7 @@ from logger_config import logger
 from modules.base import BaseModule
 from modules.renderer.grid import GRID_KEYS, GRID_VIEWS, compose_grid
 from modules.renderer.settings import RendererConfig
+from pipeline.batch_stats import STATS
 from pipeline.task import PipelineTask
 
 _RUNNER_JS = Path(__file__).parent / "render_service" / "render_runner.mjs"
@@ -46,10 +46,23 @@ class _Slot:
     task: asyncio.Task | None = None
 
 
+class _SpecResp:
+    """[patch_loop] edit 10: the final views of a speculative combined request (render_views_spec), replayed through
+    _render_and_fill's normal response handling as if the final request had just returned them."""
+    status_code = 200
+    text = ""
+
+    def __init__(self, views: dict) -> None:
+        self._views = views
+
+    def json(self) -> dict:
+        return {"views": self._views}
+
+
 class RendererModule(BaseModule):
     _PING_INTERVAL_S = 5.0
-    _PING_TIMEOUT_S = 15.0
-    _PING_STRIKES = 6
+    _PING_TIMEOUT_S = 5.0
+    _PING_STRIKES = 3
     _SPAWN_BACKOFF_INITIAL_S = 1.0
     _SPAWN_BACKOFF_MAX_S = 30.0
     _TERM_GRACE_S = 5.0
@@ -97,6 +110,7 @@ class RendererModule(BaseModule):
 
     async def _supervise(self, slot: _Slot) -> None:
         backoff = self._SPAWN_BACKOFF_INITIAL_S
+        spawned = 0
         while not self._shutting_down:
             try:
                 sc = await self._spawn_sidecar(slot.idx)
@@ -106,10 +120,14 @@ class RendererModule(BaseModule):
                 logger.warning(
                     f"[RENDERER] sidecar #{slot.idx} spawn failed: {exc} — retry in {backoff:.0f}s"
                 )
+                STATS.sidecar_spawn_fail()
                 await asyncio.sleep(backoff + random.uniform(0.0, 0.5))
                 backoff = min(backoff * 2.0, self._SPAWN_BACKOFF_MAX_S)
                 continue
 
+            if spawned:
+                STATS.sidecar_restart()  # a re-spawn after a monitored death (participant-diag `render=.../restarts`)
+            spawned += 1
             ready_at = time.monotonic()
             slot.sidecar = sc
             try:
@@ -148,13 +166,7 @@ class RendererModule(BaseModule):
         stderr_task = asyncio.create_task(
             self._pipe_logger(proc.stderr, f"#{idx}/stderr")
         )
-        # Idle connections expire well before the sidecar's keepAliveTimeout
-        # (render_runner.mjs), so a pooled connection is never reused just as
-        # the server closes it — that race surfaced as ReadError retries.
-        client = httpx.AsyncClient(
-            timeout=self.config.request_timeout_s,
-            limits=httpx.Limits(keepalive_expiry=30.0),
-        )
+        client = httpx.AsyncClient(timeout=self.config.request_timeout_s)
         try:
             browser_pid = await self._wait_ready_for(proc, client, port, idx)
         except BaseException:
@@ -260,20 +272,26 @@ class RendererModule(BaseModule):
                 await self._teardown_sidecar(sc)
         self._slots = []
 
-    def _next_sidecar(self) -> _Sidecar | None:
+    def _next_sidecar(self, exclude: int | None = None) -> _Sidecar | None:
         live = [s.sidecar for s in self._slots if s.sidecar is not None]
         if not live:
             return None
-        sc = live[self._dispatch_counter % len(live)]
+        inflight = self.__dict__.setdefault("_inflight", {})   # [patch_loop] least-loaded dispatch
+        start = self._dispatch_counter % len(live)
+        order = live[start:] + live[:start]
+        if exclude is not None and len(order) > 1:   # a retry never goes back to the sidecar that just failed
+            order = [s for s in order if s.idx != exclude] or order
+        sc = min(order, key=lambda s: inflight.get(s.idx, 0))
         self._dispatch_counter += 1
         return sc
 
-    @staticmethod
-    def _hold(slot: asyncio.Semaphore | None):
-        """Guard for the sidecar request only. ``slot`` is the pipeline's render
-        semaphore; decoding the views and composing the grid run after it is
-        released, so they never keep a render slot busy."""
-        return slot if slot is not None else contextlib.nullcontext()
+    def _inflight_release(self, idx: int, failed: bool) -> None:
+        # [patch_loop] a failed post (exception or HTTP 5xx) keeps counting as busy for 5 s, so a fast-failing
+        # sidecar does not look idle and pull the traffic
+        if failed:
+            asyncio.get_running_loop().call_later(5.0, self._inflight_release, idx, False)
+        else:
+            self._inflight[idx] -= 1
 
     async def _post_with_retry(self, path: str, payload: dict) -> tuple[httpx.Response, int]:
         """POST to a live sidecar; on a dead-channel error retry once,
@@ -287,13 +305,22 @@ class RendererModule(BaseModule):
         if sc is None:
             raise RuntimeError("no sidecars available")
         try:
-            resp = await sc.client.post(
-                f"http://{self.config.sidecar_host}:{sc.port}{path}", json=payload
-            )
+            self._inflight[sc.idx] = self._inflight.get(sc.idx, 0) + 1
+            _failed = True
+            try:
+                resp = await sc.client.post(
+                    f"http://{self.config.sidecar_host}:{sc.port}{path}", json=payload
+                )
+                _failed = resp.status_code >= 500
+            except asyncio.CancelledError:
+                _failed = False
+                raise
+            finally:
+                self._inflight_release(sc.idx, _failed)
             return resp, sc.idx
         except (*_RETRYABLE_ERRORS, RuntimeError) as exc:
             first_idx = sc.idx
-            retry_sc = self._next_sidecar()
+            retry_sc = self._next_sidecar(exclude=first_idx)
             if retry_sc is not None and retry_sc.idx == first_idx:
                 alt = self._next_sidecar()
                 if alt is not None and alt.idx != first_idx:
@@ -304,20 +331,27 @@ class RendererModule(BaseModule):
                 f"[RENDERER] {path} on sidecar #{first_idx} failed "
                 f"({type(exc).__name__}: {exc}) — retrying on sidecar #{retry_sc.idx}"
             )
-            resp = await retry_sc.client.post(
-                f"http://{self.config.sidecar_host}:{retry_sc.port}{path}", json=payload
-            )
+            self._inflight[retry_sc.idx] = self._inflight.get(retry_sc.idx, 0) + 1
+            _failed = True
+            try:
+                resp = await retry_sc.client.post(
+                    f"http://{self.config.sidecar_host}:{retry_sc.port}{path}", json=payload
+                )
+                _failed = resp.status_code >= 500
+            except asyncio.CancelledError:
+                _failed = False
+                raise
+            finally:
+                self._inflight_release(retry_sc.idx, _failed)
             return resp, retry_sc.idx
 
-    async def process(
-        self, task: PipelineTask, slot: asyncio.Semaphore | None = None
-    ) -> PipelineTask:
+    async def process(self, task: PipelineTask) -> PipelineTask:
         """Render the 2x2 grid (4 orbit views composed in Python)."""
-        await self._render_and_fill(task, self._grid_specs(), slot)
+        await self._render_and_fill(task, self._grid_specs())
         return task
 
     async def process_with_judge_views(
-        self, task: PipelineTask, slot: asyncio.Semaphore | None = None
+        self, task: PipelineTask
     ) -> tuple[dict[str, bytes], dict[str, bytes]]:
         """Grid + judge views in one sidecar request; fills the same task fields
         as ``process()`` and returns ``(white_views, gray_views)``.
@@ -329,25 +363,17 @@ class RendererModule(BaseModule):
             "bg": self.config.judge_gray_bg,
             "key": self._JUDGE_GRAY_KEY,
         })
-        rendered = await self._render_and_fill(task, specs, slot)
+        rendered = await self._render_and_fill(task, specs)
 
         gray_png = rendered.pop(self._JUDGE_GRAY_KEY, None)
         gray = {self._JUDGE_GRAY_VIEW: gray_png} if gray_png else {}
         return rendered, gray
 
     async def render_views(
-        self,
-        task: PipelineTask,
-        views: list[str],
-        *,
-        img_size: int,
-        slot: asyncio.Semaphore | None = None,
+        self, task: PipelineTask, views: list[str], *, img_size: int
     ) -> dict[str, bytes]:
-        """Render named preset views only, at ``img_size``, on the judge's white background.
-
-        No grid, no mutation of the task: a probe the caller reads and discards.
-        Returns an empty dict on any failure — callers treat that as "no decision".
-        """
+        """Render named preset views only, at ``img_size``, on the judge's white background (orientation probe).
+        No grid, no mutation of the task; returns an empty dict on any failure (callers treat that as "no decision")."""
         if task.failed or (not task.js_code and not task.scene_json):
             return {}
         payload: dict = {
@@ -358,27 +384,93 @@ class RendererModule(BaseModule):
             payload["object"] = task.scene_json
         else:
             payload["source"] = task.js_code
-
-        async with self._hold(slot):
-            try:
-                resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
-            except Exception as exc:  # noqa: BLE001 - a probe never fails its caller
-                logger.warning(f"[RENDERER] '{task.stem}' probe FAIL (http) | {type(exc).__name__}: {exc}")
-                return {}
-        if resp.status_code != 200:
-            logger.warning(
-                f"[RENDERER] '{task.stem}' probe FAIL (status) sidecar=#{sidecar_idx} | "
-                f"HTTP {resp.status_code}: {resp.text[:200] if resp.text else ''}"
-            )
+        try:
+            resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
+        except Exception as exc:  # a probe never fails its caller
+            logger.warning(f"[RENDERER] '{task.stem}' probe FAIL (http) | {type(exc).__name__}: {exc}")
             return {}
-
+        if resp.status_code != 200:
+            logger.warning(f"[RENDERER] '{task.stem}' probe FAIL (status) sidecar=#{sidecar_idx} | HTTP {resp.status_code}")
+            return {}
         rendered: dict[str, bytes] = {}
         for name, b64 in (resp.json().get("views") or {}).items():
             try:
                 rendered[name] = base64.b64decode(b64)
-            except Exception as exc:  # noqa: BLE001 - skip a single bad view, keep the rest
+            except Exception as exc:  # skip a single bad view, keep the rest
                 logger.warning(f"[RENDERER] probe view {name!r} decode failed: {exc}")
         return rendered
+
+    async def render_views_spec(
+        self, task: PipelineTask, views: list[str], *, img_size: int
+    ) -> dict[str, bytes]:
+        """[patch_loop] edit 10 (SPEC_FINAL=1; called by orient_task inside the probe's render slot). ONE request = the
+        probe views as render_views sends them (+ "size", key "probe_<view>": right/back/left/top_down are final view
+        names too) + the final views exactly as process_with_judge_views builds them, at options.imgSize. Returns the
+        probe views like render_views; the final views are kept on the task (single use, dropped by orient_task unless
+        the decision is "no rotation") for _render_and_fill. Any failure -> the leader's own probe request."""
+        task.__dict__.pop("_spec_final", None)
+        if self.__dict__.get("_spec_broken") or task.failed or task.scene_json is None:
+            return await self.render_views(task, views, img_size=img_size)
+        finals = self._spec_final_specs()
+        payload: dict = {
+            "views": [{"name": v, "bg": self.config.judge_white_bg, "key": f"probe_{v}", "size": img_size}
+                      for v in views] + finals,
+            "options": {"imgSize": self.config.img_size, "lighting": self.config.lighting.value},
+            "object": task.scene_json,
+        }
+        why = None
+        try:
+            resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
+            if resp.status_code != 200:
+                why = f"HTTP {resp.status_code}"
+            else:
+                got = resp.json().get("views") or {}
+                probe = {v: base64.b64decode(got[f"probe_{v}"]) for v in views}
+                bad = [v for v, b in probe.items() if b[12:16] != b"IHDR"
+                       or int.from_bytes(b[16:20], "big") != img_size or int.from_bytes(b[20:24], "big") != img_size]
+                if bad:
+                    self._spec_broken = True
+                    why = f"probe views {bad} not {img_size} px (render_service JS without per-view sizes?) -> SPEC_FINAL off"
+                    logger.error(f"[RENDERER] speculative final: {why}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - incl. a missing probe key or a bad base64 view
+            why = f"{type(exc).__name__}: {exc}"
+        if why is not None:
+            logger.warning(f"[RENDERER] '{task.stem}' spec probe FAIL ({why}) -> plain probe")
+            return await self.render_views(task, views, img_size=img_size)
+        task._spec_final = (finals, task.scene_json, task.js_code,
+                            {k: b for k, b in got.items() if not k.startswith("probe_")}, sidecar_idx)
+        return probe
+
+    def _spec_final_specs(self) -> list[dict]:
+        """[patch_loop] edit 10: the view specs process_with_judge_views sends (kept in sync by _spec_take's check)."""
+        specs = self._grid_specs()
+        specs += [{"name": n, "bg": self.config.judge_white_bg} for n in self._JUDGE_WHITE_VIEWS]
+        specs.append({
+            "name": self._JUDGE_GRAY_VIEW,
+            "bg": self.config.judge_gray_bg,
+            "key": self._JUDGE_GRAY_KEY,
+        })
+        return specs
+
+    def spec_ready(self, task: PipelineTask) -> bool:
+        """[patch_loop] edit 10: process_with_judge_views(task) will replay a kept speculative final (no request)."""
+        s = task.__dict__.get("_spec_final")
+        return (s is not None and s[1] is not None and s[1] is task.scene_json and s[2] == task.js_code
+                and s[0] == self._spec_final_specs())
+
+    def _spec_take(self, task: PipelineTask, view_specs: list[dict]):
+        """[patch_loop] edit 10: pop the kept speculative final; a (response, sidecar_idx) pair only when it was
+        rendered from this very scene with exactly these view specs."""
+        s = task.__dict__.pop("_spec_final", None)
+        if s is None:
+            return None
+        if s[1] is None or s[1] is not task.scene_json or s[2] != task.js_code or s[0] != view_specs:
+            logger.warning(f"[RENDERER] '{task.stem}' speculative final discarded (request differs)")
+            return None
+        logger.info(f"[RENDERER] '{task.stem}' speculative final reused (rendered with the probe)")
+        return _SpecResp(s[3]), s[4]
 
     def _grid_specs(self) -> list[dict]:
         bg = self.config.bg_color
@@ -396,9 +488,7 @@ class RendererModule(BaseModule):
     _JUDGE_GRAY_VIEW = "front_left"
     _JUDGE_GRAY_KEY = "front_left_gray"
 
-    async def _render_and_fill(
-        self, task: PipelineTask, view_specs: list[dict], slot: asyncio.Semaphore | None = None
-    ) -> dict[str, bytes]:
+    async def _render_and_fill(self, task: PipelineTask, view_specs: list[dict]) -> dict[str, bytes]:
         """One /render/views request: grid tiles composed into ``task.rendered_png``
         (missing/invalid tile is fatal), remaining views returned."""
         if task.failed or (not task.js_code and not task.scene_json):
@@ -421,27 +511,34 @@ class RendererModule(BaseModule):
             payload["source"] = task.js_code
             size_note = f"js_code={len(task.js_code)} bytes"
 
-        async with self._hold(slot):
-            logger.info(
-                f"[RENDERER] '{task.stem}' start | views={len(view_specs)} "
-                f"| path={'object' if use_object else 'code'} | {size_note}"
-            )
+        logger.info(
+            f"[RENDERER] '{task.stem}' start | views={len(view_specs)} "
+            f"| path={'object' if use_object else 'code'} | {size_note}"
+        )
 
-            t0 = time.monotonic()
-            try:
+        t0 = time.monotonic()
+        _spec = self._spec_take(task, view_specs)   # [patch_loop] edit 10: None unless SPEC_FINAL kept this final
+        try:
+            if _spec is not None:
+                resp, sidecar_idx = _spec
+            else:
                 resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
-            except Exception as exc:
-                task.render_errors = [f"{type(exc).__name__}: {exc}"]
-                logger.warning(
-                    f"[RENDERER] '{task.stem}' FAIL (http) | {task.render_errors[0]}"
-                )
-                return {}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            task.render_errors = [f"{type(exc).__name__}: {exc}"]
+            STATS.render_done(time.monotonic() - t0, False)
+            logger.warning(
+                f"[RENDERER] '{task.stem}' FAIL (http) | {task.render_errors[0]}"
+            )
+            return {}
 
-            task.render_ms = (time.monotonic() - t0) * 1000.0
+        task.render_ms = (time.monotonic() - t0) * 1000.0
 
         if resp.status_code != 200:
             detail = resp.text[:200] if resp.text else ""
             task.render_errors = [f"HTTP {resp.status_code}: {detail}"]
+            STATS.render_done(task.render_ms / 1000.0, False)
             logger.warning(
                 f"[RENDERER] '{task.stem}' FAIL (status) sidecar=#{sidecar_idx} | "
                 f"{task.render_errors[0]} | render={task.render_ms/1000:.1f}s"
@@ -462,12 +559,14 @@ class RendererModule(BaseModule):
             )
         except (KeyError, ValueError) as exc:
             task.render_errors = [f"grid tile invalid: {exc}"]
+            STATS.render_done(task.render_ms / 1000.0, False)
             logger.warning(
                 f"[RENDERER] '{task.stem}' FAIL (grid) sidecar=#{sidecar_idx} | "
                 f"{task.render_errors[0]}"
             )
             return rendered
 
+        STATS.render_done(task.render_ms / 1000.0, True)
         task.refinement_rendered_pngs.append(task.rendered_png)
         logger.info(
             f"[RENDERER] '{task.stem}' PASS sidecar=#{sidecar_idx} | "

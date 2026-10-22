@@ -39,6 +39,7 @@ export function buildParams(options) {
     gap: options.gap ?? DEFAULT_GRID_GAP,
     bgColor: options.bgColor || null,
     bgs: options.bgs || null,
+    sizes: options.sizes || null,
     lighting: options.lighting || 'studio',
   };
 }

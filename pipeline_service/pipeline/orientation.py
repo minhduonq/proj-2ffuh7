@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 from enum import Enum
 
 from PIL import Image
@@ -98,6 +99,8 @@ async def _decide(embedder, ref_vec, views: dict[str, bytes]) -> tuple[dict[str,
 
     if best is ProbeView.FRONT:
         return sims, None
+    if best is ProbeView.BACK:
+        return sims, None
     if best in _SIDE_YAW:
         return sims, Rotation(
             best_view=best,
@@ -121,7 +124,50 @@ async def _decide(embedder, ref_vec, views: dict[str, bytes]) -> tuple[dict[str,
     return sims, Rotation(best_view=best, steps=steps, image_rotation_deg=image_deg)
 
 
-async def orient_task(
+_SPEC_RATE: dict[str, list[int]] = {}   # [patch_loop] edit 10: prompt -> [rotated, decided] drafts so far
+_SPEC_PRIOR, _SPEC_PRIOR_N = 0.32, 4.0
+
+
+def _spec_prompt(stem: str) -> str:
+    return stem.split("#", 1)[0]
+
+
+def _spec_on(task: PipelineTask, renderer) -> bool:
+    """SPEC_FINAL=1, a scene_json render (per-view sizes need object-page.html) and the prompt's running rotation
+    rate (prior 0.32 as 4 drafts) below SPEC_FINAL_MAX_RATE (default 0.4)."""
+    if os.environ.get("SPEC_FINAL") != "1" or task.scene_json is None or not hasattr(renderer, "render_views_spec"):
+        return False
+    if not getattr(getattr(renderer, "config", None), "judge_multiview", False):   # review: no judge views -> no reuse
+        return False
+    try:
+        max_rate = float(os.environ.get("SPEC_FINAL_MAX_RATE", "0.4"))
+    except ValueError:
+        max_rate = 0.4
+    rot, n = _SPEC_RATE.get(_spec_prompt(task.stem), (0, 0))
+    return (rot + _SPEC_PRIOR * _SPEC_PRIOR_N) / (n + _SPEC_PRIOR_N) < max_rate
+
+
+async def orient_task(task: PipelineTask, **kwargs) -> OrientationResult:
+    """[patch_loop] edit 10: the leader's orient_task (below). SPEC_FINAL=1: the speculative final kept by the probe
+    survives only a "no rotation" decision (task untouched); every other outcome, exception or cancellation drops it.
+    Each decided draft updates its prompt's rotation rate."""
+    if os.environ.get("SPEC_FINAL") != "1":
+        return await _orient_task_leader(task, **kwargs)
+    try:
+        res = await _orient_task_leader(task, **kwargs)
+    except BaseException:
+        task.__dict__.pop("_spec_final", None)
+        raise
+    if res.reason != "already_front":
+        task.__dict__.pop("_spec_final", None)
+    if res.reason == "already_front" or res.rotation is not None:
+        st = _SPEC_RATE.setdefault(_spec_prompt(task.stem), [0, 0])
+        st[0] += res.rotation is not None
+        st[1] += 1
+    return res
+
+
+async def _orient_task_leader(
     task: PipelineTask,
     *,
     renderer,
@@ -136,17 +182,23 @@ async def orient_task(
     """Probe, decide, and rewrite `task.js_code` / `task.scene_json` in place when a rotation helps.
 
     The probe render and the re-check hold their own stage's semaphore, so neither waits on the other's
-    pool; the render slot covers only the sidecar request, not decoding the views.
-    Every failure path leaves the task untouched: a candidate is never dropped for failing to rotate.
+    pool. Every failure path leaves the task untouched: a candidate is never dropped for failing to rotate.
     """
     if not config.enabled or embedder is None or ref_vec is None:
         return OrientationResult(reason="disabled")
 
+    render_guard = sem_render if sem_render is not None else contextlib.nullcontext()
     check_guard = sem_check if sem_check is not None else contextlib.nullcontext()
 
-    views = await renderer.render_views(
-        task, [v.value for v in ProbeView], img_size=config.img_size, slot=sem_render
-    )
+    async with render_guard:
+        if _spec_on(task, renderer):   # [patch_loop] edit 10 (SPEC_FINAL=1): probe + unrotated final, one request
+            views = await renderer.render_views_spec(
+                task, [v.value for v in ProbeView], img_size=config.img_size
+            )
+        else:
+            views = await renderer.render_views(
+                task, [v.value for v in ProbeView], img_size=config.img_size
+            )
     if not views:
         return OrientationResult(reason="probe_failed")
 
@@ -156,6 +208,11 @@ async def orient_task(
         logger.warning(f"[ORIENT] '{task.stem}' decision failed: {type(exc).__name__}: {exc}")
         return OrientationResult(reason="decision_failed")
 
+    try:  # [patch_loop] edit 9, logging only: probe similarities (offline: rotation margin O3, loser pre-filter)
+        logger.info(f"[ORIENT_SIMS] '{task.stem}' " + __import__("json").dumps(
+            {str(getattr(k, "value", k)): round(float(v), 5) for k, v in (sims or {}).items()}, separators=(",", ":")))
+    except Exception:
+        pass
     if rotation is None:
         best = ProbeView(max(sims, key=sims.get)) if sims else None
         logger.info(f"[ORIENT] '{task.stem}' best={best.value if best else '?'} | no rotation")

@@ -6,8 +6,12 @@ VLLM_VERSION="${VLLM_VERSION:-0.23.0}"
 VLLM_CUDA_TAG="${VLLM_CUDA_TAG:-cu129}"
 MANYLINUX="${MANYLINUX:-manylinux_2_28}"
 TORCH_BACKEND="${TORCH_BACKEND:-cu128}"
-TRANSFORMERS_SPEC="${TRANSFORMERS_SPEC:-transformers>=5.0.0rc0}"
-FASTAPI_SPEC="${FASTAPI_SPEC:-fastapi<0.137}"
+TRANSFORMERS_SPEC="${TRANSFORMERS_SPEC:-transformers==5.17.0}"
+FASTAPI_SPEC="${FASTAPI_SPEC:-fastapi==0.136.3}"
+PIP_VERSION="${PIP_VERSION:-26.2.1}"
+UV_VERSION="${UV_VERSION:-0.12.20}"
+# Exact versions of every dependency, per vllm version (frozen from a verified deploy).
+CONSTRAINTS="${CONSTRAINTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/constraints-vllm-${VLLM_VERSION}.txt}"
 MODEL="${MODEL:-zai-org/GLM-4.6V-Flash}"
 MODEL_REVISION="${MODEL_REVISION:-}"
 
@@ -17,10 +21,17 @@ WHEEL_URL="${WHEEL_URL:-https://github.com/vllm-project/vllm/releases/download/v
 echo "[glm-env] $VENV | vllm ${VLLM_VERSION}+${VLLM_CUDA_TAG} | torch=$TORCH_BACKEND | $TRANSFORMERS_SPEC"
 echo "[glm-env] wheel: $WHEEL_URL"
 "$PYBIN" -m venv "$VENV"
-"$VENV/bin/pip" install --upgrade pip uv
+"$VENV/bin/pip" install "pip==${PIP_VERSION}" "uv==${UV_VERSION}"
+CONSTRAINT_ARGS=()
+if [ -f "$CONSTRAINTS" ]; then
+    CONSTRAINT_ARGS=(--constraint "$CONSTRAINTS")
+    echo "[glm-env] constraints: $CONSTRAINTS ($(grep -c "==" "$CONSTRAINTS") pins)"
+else
+    echo "[glm-env] WARNING: no constraints file for vllm ${VLLM_VERSION} ($CONSTRAINTS) -> dependencies resolve to latest" >&2
+fi
 
 if ! "$VENV/bin/uv" pip install --python "$VENV/bin/python" \
-        "vllm @ ${WHEEL_URL}" "$TRANSFORMERS_SPEC" "$FASTAPI_SPEC" --torch-backend "$TORCH_BACKEND"; then
+        "vllm @ ${WHEEL_URL}" "$TRANSFORMERS_SPEC" "$FASTAPI_SPEC" ${CONSTRAINT_ARGS[@]+"${CONSTRAINT_ARGS[@]}"} --torch-backend "$TORCH_BACKEND"; then
     echo "[glm-env] FAIL installing $WHEEL_URL" >&2
     echo "  Check the real asset names for your version:" >&2
     echo "    curl -s https://api.github.com/repos/vllm-project/vllm/releases/tags/v${VLLM_VERSION} | grep -o '[^\"]*\\.whl'" >&2

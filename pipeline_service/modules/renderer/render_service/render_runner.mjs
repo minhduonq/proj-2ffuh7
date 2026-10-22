@@ -114,6 +114,7 @@ async function handleRenderViews(req, res) {
   const phis = [];
   const labels = [];
   const bgs = [];
+  const sizes = [];
   for (const spec of viewSpecs) {
     const name = typeof spec === 'string' ? spec : spec?.name;
     if (name == null && typeof spec === 'object' && spec !== null) {
@@ -129,6 +130,7 @@ async function handleRenderViews(req, res) {
       phis.push(spec.phi);
       labels.push(spec.key);
       bgs.push(spec.bg || null);
+      sizes.push(Number.isInteger(spec.size) ? spec.size : null);
       continue;
     }
     if (typeof spec === 'object' && spec !== null && (spec.theta != null || spec.phi != null)) {
@@ -144,13 +146,14 @@ async function handleRenderViews(req, res) {
     phis.push(preset.phi);
     labels.push(typeof spec === 'string' ? name : (spec.key || name));
     bgs.push(typeof spec === 'string' ? null : (spec.bg || null));
+    sizes.push(typeof spec === 'object' && spec !== null && Number.isInteger(spec.size) ? spec.size : null);
   }
   if (new Set(labels).size !== labels.length) {
     sendJson(res, 400, { error: 'duplicate view keys in request' });
     return;
   }
 
-  const options = { ...(payload.options || {}), thetas, phis, bgs };
+  const options = { ...(payload.options || {}), thetas, phis, bgs, sizes: sizes.some((x) => x) ? sizes : null };
 
   const lightingErr = lightingError(options);
   if (lightingErr) {
@@ -284,12 +287,6 @@ process.on('unhandledRejection', (err) => {
   console.error('[render_runner] unhandled rejection:', err);
   process.exit(1);
 });
-
-// Node's 5s default equals httpx's default keepalive expiry, so the client could
-// reuse a connection just as the server closed it (ReadError). Keep idle
-// connections open far longer than the client pool does (30s, module.py).
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
 
 async function main() {
   console.log('[render_runner] starting static server...');

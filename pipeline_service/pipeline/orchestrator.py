@@ -5,8 +5,8 @@ import time
 
 import httpx
 
-from config.settings import BracketConfig, OrientationConfig
 from llm.session_store import SessionStore
+from config.settings import OrientationConfig
 from logger_config import logger
 from pipeline.stages import (
     code_and_check,
@@ -17,10 +17,6 @@ from pipeline.stages import (
     StageError,
 )
 from pipeline.task import PipelineTask
-
-# The hard per-task timeout sits this far past the soft deadline, so multigen has time to cut its
-# bracket and ship before the task is cancelled outright.
-_HARD_DEADLINE_GRACE_S = 15.0
 
 
 class Pipeline:
@@ -50,8 +46,8 @@ class Pipeline:
         coder_ensemble_temperature: float = 0.3,
         render_from_object: bool = False,
         seed_offset: int = 0,
-        bracket: BracketConfig | None = None,
         orientation: OrientationConfig | None = None,
+        candidate_deadline_s: float = 0.0,
         refinement_enabled: bool = True,
         planner_limit: int = 2,
         coder_limit: int = 2,
@@ -75,8 +71,8 @@ class Pipeline:
         self.coder_ensemble_temperature = coder_ensemble_temperature
         self.render_from_object = render_from_object
         self.seed_offset = seed_offset
-        self.bracket = bracket or BracketConfig()
         self.orientation = orientation or OrientationConfig()
+        self.candidate_deadline_s = candidate_deadline_s
         self.refinement_enabled = refinement_enabled
 
         self.max_iter = max_iter
@@ -106,7 +102,7 @@ class Pipeline:
             return True
         return False
 
-    async def _run(self, task: PipelineTask, deadline: float | None = None) -> None:
+    async def _run(self, task: PipelineTask) -> None:
 
         # Planner with downloading image
         await prepare_inputs_stage(
@@ -144,9 +140,8 @@ class Pipeline:
                     ensemble_temperature=self.coder_ensemble_temperature,
                     render_from_object=self.render_from_object,
                     seed_offset=self.seed_offset,
-                    bracket=self.bracket,
                     orientation=self.orientation,
-                    deadline=deadline,
+                    candidate_deadline_s=self.candidate_deadline_s,
                 )
             else:
                 # Next iterations without multigen (base coder, patcher and repair agent)
@@ -206,20 +201,13 @@ class Pipeline:
             task.rendered_png = task.best_rendered_png
            
 
-    async def run_one(self, task: PipelineTask, deadline: float | None = None) -> PipelineTask:
-        """Run one task. Its soft deadline is `task_deadline_s` from now or the caller's `deadline`
-        (event-loop clock), whichever is earlier; multigen ships its best candidate at that point."""
+    async def run_one(self, task: PipelineTask) -> PipelineTask:
         task.started_at = time.time()
         self.task_status[task.stem] = "pending"
-        loop = asyncio.get_running_loop()
-        soft = loop.time() + self.task_deadline_s
-        if deadline is not None:
-            soft = min(soft, deadline)
-        budget_s = soft - loop.time()
 
         try:
-            async with asyncio.timeout_at(soft + _HARD_DEADLINE_GRACE_S):
-                await self._run(task, soft)
+            async with asyncio.timeout(self.task_deadline_s):
+                await self._run(task)
 
             task.failed = False
             task.failure_reason = None
@@ -228,10 +216,10 @@ class Pipeline:
 
         except TimeoutError:
             task.failed = True
-            task.failure_reason = f"budget exceeded ({budget_s:.0f}s)"
+            task.failure_reason = f"budget exceeded ({self.task_deadline_s}s)"
             task.failure_stage = "deadline"
             self.task_status[task.stem] = "failed"
-            logger.warning(f"[DEADLINE] {task.stem} exceeded {budget_s:.0f}s")
+            logger.warning(f"[DEADLINE] {task.stem} exceeded {self.task_deadline_s}s")
 
         except StageError as exc:
             task.failed = True
@@ -261,5 +249,5 @@ class Pipeline:
     async def stop(self) -> None:
         pass
 
-    async def submit(self, task: PipelineTask, deadline: float | None = None) -> asyncio.Task[PipelineTask]:
-        return asyncio.create_task(self.run_one(task, deadline))
+    async def submit(self, task: PipelineTask) -> asyncio.Task[PipelineTask]:
+        return asyncio.create_task(self.run_one(task))

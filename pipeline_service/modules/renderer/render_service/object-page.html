@@ -222,6 +222,8 @@ function withParsedRoot(json, params, render) {
 }
 
 function renderView(i, params) {
+  const __sz = params.sizes && params.sizes[i] ? params.sizes[i] : params.imgSize;
+  if (__sz !== _imgSize) { renderer.setSize(__sz, __sz); _imgSize = __sz; }
   if (params.bgs) {
     const bg = params.bgs[i] || params.bgColor;
     scene.background = new THREE.Color(bg ? `#${bg}` : 0xffffff);
