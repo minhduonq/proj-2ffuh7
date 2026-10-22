@@ -1,8 +1,3 @@
-api:
-  host: "0.0.0.0"
-  port: 10006
-  debug: true
-
 pipeline:
   batch_time_budget: 3000
   candidate_deadline_s: 2100
@@ -13,23 +8,7 @@ pipeline:
   orientation:
     enabled: true
     img_size: 512
-  # Own seed stream: same coder + prompt as team deebef, so their offset would reproduce their candidates byte for
-  # byte (a source-audit ban criterion for outputs shared across participant_ids).
-  seed_offset: 7313013
-  # Fresh critic-regeneration of the bracket winner (pipeline/refine.py). Clocks run from the batch start: no refine
-  # starts after 1200 s, a running one is cancelled at 1450 s and the bracket winner kept. The leader's K=46 batches
-  # took ~1475 s (audit R51: 5825-5938 s for 4 batches); K=34 cuts ~26% of coder work (~350 s/batch), which pays for
-  # the regenerations, so a batch still ends by ~1450-1480 s.
-  refine:
-    enabled: true
-    candidates: 4
-    accept_margin: 0.25
-    thinking: true
-    max_tokens: 20000
-    start_cutoff_s: 1200
-    deadline_s: 1450
-  # Rule-per-error repair of checker failures (pipeline/code_fix.py), CPU only.
-  code_fix: true
+  seed_offset: 14000042
   # Warm-up coder throughput probe: 48 text-only code requests x 512 tokens, aggregate output tok/s.
   # min_tps 0 = measure and log only. CALIBRATE before enabling: run one healthy 4xH200 pod, read
   # "[Coder probe] ... tok/s" from pipeline.log, set min_tps to ~0.8x that value.
@@ -58,16 +37,16 @@ llm_clients:
     api_key: "local"
     request_timeout_s: 900
     vllm:
-      model: "computer-vision-ai-lab/Qwen-3.6-27B-AmberKite"
-      revision: "14adb741b473bbd7bc0d02cacb27247d2cb707f6"
+      model: "cont1037/Qwen-3.6-27B-AmberKite"
+      revision: "a60185070e050f24b070f9695bfaac1b430c4bcd"
       gpu_ids: "0,1"
       tensor_parallel_size: 1
       data_parallel_size: 2
-      vllm_bin: "/opt/vllm-coder-env/bin/vllm"
+      vllm_bin: "/opt/prefetch/shim_a2b.sh"
       gpu_memory_utilization: 0.9
       max_model_len: 81920
       max_num_seqs: 256
-      extra_args: ["--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":2}"]
+      extra_args: ["--sgl", "--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", "cont1037/Qwen-3.6-27B-AmberKite-DFlash", "--speculative-draft-model-revision", "285795f0143bcb7a35efc4647a70bff22bb90b47", "--speculative-num-draft-tokens", "8", "--mamba-radix-cache-strategy", "extra_buffer_lazy", "--mamba-ssm-dtype", "bfloat16", "--max-mamba-cache-size", "240", "--max-running-requests", "256", "--chunked-prefill-size", "8192", "--enable-metrics", "--random-seed", "42", "--burst-glm", "0.80", "--enable-memory-saver", "--enable-weights-cpu-backup", "--enable-draft-weights-cpu-backup"]
   judge-critic-instance:
     enabled: true
     base_url: "http://localhost:8002/v1"
@@ -79,11 +58,11 @@ llm_clients:
       gpu_ids: "2"
       tensor_parallel_size: 1
       data_parallel_size: 1
-      gpu_memory_utilization: 0.9
+      gpu_memory_utilization: 0.81
       max_model_len: 81920
       max_num_seqs: 64
       extra_args: ["--max-num-batched-tokens", "16384"]
-      vllm_bin: "/opt/vllm-glm-env/bin/vllm"
+      vllm_bin: "/opt/jf/vllm_enc.sh"
       trust_remote_code: true
       reasoning_parser: null
   judge-critic-instance-b:
@@ -97,22 +76,22 @@ llm_clients:
       gpu_ids: "3"
       tensor_parallel_size: 1
       data_parallel_size: 1
-      gpu_memory_utilization: 0.9
+      gpu_memory_utilization: 0.81
       max_model_len: 81920
       max_num_seqs: 64
       extra_args: ["--max-num-batched-tokens", "16384"]
-      vllm_bin: "/opt/vllm-glm-env/bin/vllm"
+      vllm_bin: "/opt/jf/vllm_enc.sh"
       trust_remote_code: true
       reasoning_parser: null
 
 embedder:
-  model_id: "computer-vision-ai-lab/dinov3-vits16-pretrain-lvd1689m"
-  revision: "e2b5191960331471bf2734d372e6a7151a6079c5"
+  model_id: "cont1037/dinov3-vits16-pretrain-lvd1689m"
+  revision: "eba5a4160c01e50cc20d95a97225b0e75fe5b2e7"
 
 actors:
   planner:
     client: "coder-instance"
-    model: "computer-vision-ai-lab/Qwen-3.6-27B-AmberKite"
+    model: "cont1037/Qwen-3.6-27B-AmberKite"
     workers: 256
     queue_size: 128
     max_tokens: 32768
@@ -130,8 +109,8 @@ actors:
       allow_fallbacks: true
   coder:
     client: "coder-instance"
-    model: "computer-vision-ai-lab/Qwen-3.6-27B-AmberKite"
-    workers: 96
+    model: "cont1037/Qwen-3.6-27B-AmberKite"
+    workers: 128
     queue_size: 64
     max_tokens: 24576
     temperature: 0.7
@@ -143,7 +122,7 @@ actors:
     seed: 42
     enable_thinking: false
     multimodal: true
-    ensemble_size: 34
+    ensemble_size: 68
     ensemble_temperature: 0.7
     providers:
       order: []
@@ -210,7 +189,7 @@ renderer:
   sidecar_port: 8003
   startup_timeout_s: 60.0
   request_timeout_s: 90.0
-  node_binary: "node"
+  node_binary: "/opt/raff/node_aff.sh"
   img_size: 1024
   grid_gap: 5
   bg_color: null

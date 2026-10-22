@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from enum import Enum
 from pathlib import Path
 
 import yaml
@@ -11,10 +13,9 @@ from modules.judge.embedder_settings import EmbedderConfig
 from modules.renderer.settings import RendererConfig
 
 _here = Path(__file__).parent.parent
-config_file_dir = _here / "configuration.yaml"
+config_file_dir = Path(os.environ["CONFIG_FILE"]) if os.environ.get("CONFIG_FILE") else _here / "configuration.yaml"
 if not config_file_dir.exists():
     config_file_dir = _here.parent / "configuration.yaml"
-
 
 
 class APIConfig(BaseModel):
@@ -28,7 +29,7 @@ class CoderProbeConfig(BaseModel):
 
     Sends `concurrency` text-only code requests to the coder and measures aggregate output tok/s.
     The batch wall-clock is coder tokens / tok/s, so this is the one number that predicts whether the
-    audit host fits the 7200 s regeneration budget. With min_tps > 0 and replacements remaining, a slower
+    pod finishes a batch within its time budget. With min_tps > 0 and replacements remaining, a slower
     pod requests REPLACE; min_tps = 0 only logs. Calibrate on a healthy 4xH200 pod first and set min_tps
     to ~0.8 x the probe value measured there.
     """
@@ -48,44 +49,42 @@ class PreflightConfig(BaseModel):
     min_download_mbps: float | None = None
 
 
+class MonitoringConfig(BaseModel):
+    """vLLM health handling while a batch is generating. One failed probe is common under load (a busy
+    API server misses the 5 s /health timeout), and acting on it replaces the pod or aborts the batch, so
+    a client counts as down only after failing every probe for down_grace_s."""
+    down_grace_s: float = Field(default=120.0, ge=0.0)
+
+
+class BracketConfig(BaseModel):
+    """Experimental judge-bracket variants. Each changes which candidate wins, so measure judge agreement
+    offline before enabling any of them in production."""
+    final_round_robin: bool = False
+    tiebreak_confirmation: bool = False
+    tiebreak_temperature: float = Field(default=0.3, ge=0.0, le=1.0)
+    log_similarity: bool = False
+
+
 class OrientationConfig(BaseModel):
-    """Bring each candidate to the orientation the judge scores it in, before the bracket: a low-res 5-view probe
-    (front/right/back/left/top_down) picks the side whose DINOv3 embedding best matches the reference, and the
-    rotation is written into the candidate's own generate(). 180-degree flips are never applied."""
+    """Bring a candidate to the orientation the judge scores it in: a cheap low-res probe picks the side that
+    matches the reference, the rotation is then written into the candidate's own generate() before its return.
+    Enable only after an offline judge agreement run, since it changes which candidate wins."""
     enabled: bool = False
     img_size: int = 512
 
 
-class RefineConfig(BaseModel):
-    """Fresh critic-regeneration of the bracket winner (never shows the old code to the coder).
-
-    N visual + N build-technique critiques (GLM) -> N programs written from scratch (coder, thinking on) -> the same
-    checker/orientation/render path as a bracket candidate -> full S1 duel against the winner. A regeneration
-    replaces the winner only if it wins AND beats it by >= accept_margin S1 penalty points. Both clocks run from the
-    start of the BATCH: no refine starts after `start_cutoff_s`; a refine still running at `deadline_s` is cancelled
-    and the bracket winner is kept, so a batch never runs much past `deadline_s` because of refine."""
-    enabled: bool = False
-    candidates: int = Field(default=4, ge=1, le=8)
-    accept_margin: float = Field(default=0.25, ge=0.0)
-    thinking: bool = True
-    max_tokens: int = Field(default=20000, ge=1024)
-    start_cutoff_s: float = Field(default=1200.0, gt=0.0)
-    deadline_s: float = Field(default=1450.0, gt=0.0)
-
-    @model_validator(mode="after")
-    def _deadline_after_cutoff(self) -> "RefineConfig":
-        if self.deadline_s <= self.start_cutoff_s:
-            raise ValueError("pipeline.refine.deadline_s must be greater than start_cutoff_s")
-        return self
-
-
 class PipelineConfig(BaseModel):
+    # Generation window of one round: the orchestrator's clock runs from the first POST /generate to the
+    # last /results download and covers `round_batches` batches (docs/Competition Information/02, §5).
+    # Each batch gets the window's remaining time split over the round's remaining batches, capped by
+    # batch_time_budget.
+    round_time_budget: float = 14400.0
+    round_batches: int = Field(default=4, ge=1)
     batch_time_budget: float = 1800.0
-    # Wall-clock (from task start) after which a candidate that has not finished coding is
-    # dropped as a walkover, so the bracket completes on the candidates that exist. 0 = off.
-    # Must exceed a normal batch (tail candidates finish near batch end) and sit well inside
-    # event_bus.task_deadline_s.
-    candidate_deadline_s: float = 0.0
+    # Retries per task after a failure; never for deadline failures, and only while the batch has at
+    # least retry_min_remaining_s left.
+    task_retries: int = Field(default=1, ge=0)
+    retry_min_remaining_s: float = 180.0
     prompt_timeout: float = 120.0
     use_planner: bool = True
     render_from_object: bool = False
@@ -94,15 +93,10 @@ class PipelineConfig(BaseModel):
     # (multigen + judge bracket when ensemble_size > 1, else a single coder pass).
     refinement_enabled: bool = True
     coder_probe: CoderProbeConfig = Field(default_factory=CoderProbeConfig)
-    # Added to the round seed for every candidate (seed = round_seed + seed_offset + k). Give each of our
-    # participant_ids a different offset so two participants never sample the same seed stream: byte-identical outputs
-    # shared across participant_ids are a source-audit ban criterion.
     seed_offset: int = 0
+    bracket: BracketConfig = Field(default_factory=BracketConfig)
     orientation: OrientationConfig = Field(default_factory=OrientationConfig)
-    refine: RefineConfig = Field(default_factory=RefineConfig)
-    # Candidates that fail the BTC checker get deterministic rule-per-error repairs (pipeline/code_fix.py) and are
-    # re-checked, instead of being dropped outright. CPU only.
-    code_fix: bool = False
+    candidate_dump_dir: str | None = None
 
 
 class VllmServeConfig(BaseModel):
@@ -151,10 +145,6 @@ class LLMClientConfig(BaseModel):
     api_key_env: str = ""
     api_key: str = ""
     enabled: bool = False
-    # httpx read timeout for one chat completion against this endpoint. Coder concurrency is
-    # capped by actors.coder.workers (no server-side queueing), so this bounds one request's
-    # service time; a request that exceeds it is dropped (one candidate), never retried.
-    request_timeout_s: float = 900.0
     vllm: VllmServeConfig | None = None
 
     @property
@@ -164,21 +154,8 @@ class LLMClientConfig(BaseModel):
         url = self.base_url.lower()
         return "vllm" if any(h in url for h in _LOCAL_HOSTS) else "openrouter"
 
-class S1EarlyStopConfig(BaseModel):
-    """Judge only: in bracket rounds R1..max_round, judge the S1 front angles one at a time and skip the rest once the
-    first ones agree (both side orders consistent, same side, gap wide enough)."""
-    enabled: bool = False
-    angles: int = Field(default=2, ge=1, le=4)
-    min_gap: float = Field(default=2.0, ge=0.0)
-    single_angle_min_gap: float = Field(default=2.5, ge=0.0)
-    max_round: int = Field(default=4, ge=1)
-
-
 class ActorConfig(BaseModel):
     """Per-actor config."""
-    explain: bool = False  # judge only: run the opponent-independent 'explain' GLM call (fills detail['issues']; no effect on the verdict)
-    s1_early_stop: S1EarlyStopConfig = Field(default_factory=S1EarlyStopConfig)  # judge only
-    max_stage: int = 4  # judge only: deepest multi-stage judge stage to run (1-4). 3 skips the S4 side guard (never changed a verdict in 543 logged duels)
 
     workers: int = 1
     queue_size: int = 8
@@ -200,6 +177,37 @@ class ActorConfig(BaseModel):
     multimodal: bool = False
     providers: ProviderRoutingConfig | None = None
 
+
+class JudgeMaxStage(int, Enum):
+    """Depth of the judge cascade: S1 only, +S2 sub-judges, +S3 gray rescue on an S2 draw, +S4 side guard (full)."""
+    S1 = 1
+    S2 = 2
+    S3 = 3
+    S4 = 4
+
+
+class S1EarlyStopAngles(int, Enum):
+    ONE = 1
+    TWO = 2
+
+
+class S1EarlyStopConfig(BaseModel):
+    """Skip the remaining S1 angles once the first ones agree (bracket rounds R1..max_round only)."""
+    enabled: bool = False
+    angles: S1EarlyStopAngles = S1EarlyStopAngles.TWO
+    min_gap: float = Field(default=2.0, ge=0.0)
+    single_angle_min_gap: float = Field(default=2.5, ge=0.0)
+    max_round: int = Field(default=4, ge=1)
+
+
+class JudgeConfig(ActorConfig):
+    """Judge-only knobs. `max_tokens`/`temperature` are ignored here: every cascade stage hardcodes its own."""
+    explain: bool = False
+    max_stage: JudgeMaxStage = JudgeMaxStage.S4
+    s1_concurrency: int = Field(default=8, ge=1)
+    s1_early_stop: S1EarlyStopConfig = Field(default_factory=S1EarlyStopConfig)
+
+
 class ActorsConfig(BaseModel):
     planner: ActorConfig = ActorConfig(
         workers=2, queue_size=8,
@@ -215,7 +223,7 @@ class ActorsConfig(BaseModel):
         workers=3, queue_size=8,
         client="openrouter", model="qwen/qwen2.5-vl-72b-instruct",
     )
-    judge: ActorConfig = ActorConfig(
+    judge: JudgeConfig = JudgeConfig(
         workers=4, queue_size=8,
         client="openrouter", model="qwen/qwen2.5-vl-72b-instruct",
         max_tokens=1024,
@@ -256,6 +264,7 @@ class SettingsConf(BaseSettings):
     api: APIConfig = APIConfig()
     pipeline: PipelineConfig = PipelineConfig()
     preflight: PreflightConfig = PreflightConfig()
+    monitoring: MonitoringConfig = MonitoringConfig()
     benchmark: bool = True
     warmup: bool = True
     llm_clients: dict[str, LLMClientConfig] = Field(default_factory=_default_llm_clients)
@@ -264,17 +273,6 @@ class SettingsConf(BaseSettings):
     js_checker: JSCheckerConfig = JSCheckerConfig()
     renderer: RendererConfig = RendererConfig()
     embedder: EmbedderConfig = EmbedderConfig()
-
-    @model_validator(mode="after")
-    def _validate_refine_inside_deadlines(self) -> "SettingsConf":
-        r = self.pipeline.refine
-        if r.enabled:
-            limits = {"event_bus.task_deadline_s": self.event_bus.task_deadline_s,
-                      "pipeline.batch_time_budget - 120": self.pipeline.batch_time_budget - 120}
-            for name, limit in limits.items():
-                if r.deadline_s >= limit:
-                    raise ValueError(f"pipeline.refine.deadline_s ({r.deadline_s}) must be < {name} ({limit})")
-        return self
 
     @model_validator(mode="after")
     def _validate_pure_image_requires_multimodal(self) -> "SettingsConf":

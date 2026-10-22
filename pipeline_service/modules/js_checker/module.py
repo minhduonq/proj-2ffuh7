@@ -4,9 +4,7 @@ import asyncio
 import json
 import math
 import os
-import subprocess
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from logger_config import logger
@@ -17,16 +15,6 @@ from pipeline.task import PipelineTask
 _RUNNER_JS = Path(__file__).parent / "validate_runner.mjs"
 _SERIALIZE_RUNNER_JS = Path(__file__).parent / "serialize_runner.mjs"
 _ROTATE_RUNNER_JS = Path(__file__).parent / "rotate_runner.mjs"
-
-_NODE_POOL = ThreadPoolExecutor(max_workers=64, thread_name_prefix="node")
-
-
-async def _run_node(args: list[str], cwd: str, timeout: float) -> subprocess.CompletedProcess:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _NODE_POOL,
-        lambda: subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, timeout=timeout),
-    )
 
 _RUNNERS = {
     "sanity": _RUNNER_JS,
@@ -75,40 +63,6 @@ class JSCheckerModule(BaseModule):
             return ""
         return f"bbox has non-finite coordinates ({', '.join(bad[:6])}); vertices={metrics.get('vertices', '?')}"
 
-    async def rotate_source(self, code: str, steps: list[tuple[str, str]]) -> str | None:
-        """Write `steps` (axis, angle expression) into the module's own generate(), before every return
-        (rotate_runner.mjs). Returns the rewritten source, or None when the module has no shape the injector
-        can edit -- the caller then keeps the original candidate."""
-        if not code or not steps:
-            return None
-        if not _ROTATE_RUNNER_JS.exists():
-            logger.warning(f"[JS_CHECK] rotate runner missing at {_ROTATE_RUNNER_JS}")
-            return None
-        tmp_dir = tempfile.mkdtemp(prefix="jsrotate_")
-        try:
-            code_path = os.path.join(tmp_dir, "module.mjs")
-            with open(code_path, "w", encoding="utf-8") as f:
-                f.write(code)
-            args = [arg for axis, angle in steps for arg in (axis, angle)]
-            try:
-                res = await _run_node(
-                    [self.config.node_binary, str(_ROTATE_RUNNER_JS), code_path, *args],
-                    str(_node_cwd(_ROTATE_RUNNER_JS)), 30.0,
-                )
-            except subprocess.TimeoutExpired:
-                logger.warning("[JS_CHECK] rotate runner timed out")
-                return None
-            if res.returncode != 0:
-                logger.warning(f"[JS_CHECK] rotate runner failed: {res.stderr.decode('utf-8', errors='replace').strip()[:200]}")
-                return None
-            return res.stdout.decode("utf-8", errors="replace") or None
-        except Exception as exc:  # rotation is optional, never fails the candidate
-            logger.warning(f"[JS_CHECK] rotate runner error: {exc}")
-            return None
-        finally:
-            import shutil
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
     async def process(self, task: PipelineTask, mode: str = "sanity") -> PipelineTask:
         logger.info(
             f"[JS_CHECK] '{task.stem}' start | mode={mode} | "
@@ -134,11 +88,6 @@ class JSCheckerModule(BaseModule):
             task.scene_json = result.get("object")
 
         failures = list(result.get("failures", []))
-        # NaN-geometry hole in the evaluator (ours and production alike): Box3 of NaN
-        # vertices is not isEmpty() (NaN<NaN is false) and no bound check fires, so a
-        # module whose every triangle the GPU drops still passes as valid — and the
-        # bracket can crown an invisible champion (r40 stem 0c469b0d, all-angle pen 10).
-        # JSON turns NaN into null, so a null/non-finite bbox coordinate means NaN geometry.
         if task.js_valid:
             nan_detail = self._nan_bbox_detail(task.js_metrics)
             if nan_detail:
@@ -192,6 +141,53 @@ class JSCheckerModule(BaseModule):
 
         return task
 
+    async def rotate_source(self, code: str, steps: list[tuple[str, str]]) -> str | None:
+        """Write `steps` (axis, angle expression) into the module's own generate(), before every return.
+
+        Returns the rewritten source, or None when the module has no shape the injector can edit —
+        the caller then keeps the original candidate.
+        """
+        if not code or not steps:
+            return None
+        if not _ROTATE_RUNNER_JS.exists():
+            logger.warning(f"[JS_CHECK] rotate runner missing at {_ROTATE_RUNNER_JS}")
+            return None
+
+        tmp_dir = tempfile.mkdtemp(prefix="jsrotate_")
+        try:
+            code_path = os.path.join(tmp_dir, "module.mjs")
+            with open(code_path, "w", encoding="utf-8") as f:
+                f.write(code)
+            args = [arg for axis, angle in steps for arg in (axis, angle)]
+            proc = await asyncio.create_subprocess_exec(
+                self.config.node_binary,
+                str(_ROTATE_RUNNER_JS), code_path, *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=_node_cwd(_ROTATE_RUNNER_JS),
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.warning("[JS_CHECK] rotate runner timed out")
+                return None
+            if proc.returncode != 0:
+                logger.warning(
+                    f"[JS_CHECK] rotate runner failed: {stderr.decode('utf-8', errors='replace').strip()[:200]}"
+                )
+                return None
+            rotated = stdout.decode("utf-8", errors="replace")
+            return rotated or None
+        except Exception as exc:  # noqa: BLE001 - rotation is optional, never fails the candidate
+            logger.warning(f"[JS_CHECK] rotate runner error: {exc}")
+            return None
+        finally:
+            import shutil
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     async def _validate(self, code: str, mode: str = "sanity") -> dict:
         runner = _RUNNERS.get(mode)
         if runner is None:
@@ -206,20 +202,25 @@ class JSCheckerModule(BaseModule):
             with open(code_path, "w", encoding="utf-8") as f:
                 f.write(code)
 
-            node_cwd = os.environ.get("NODE_CWD", str(runner.parent))
-            for candidate in [node_cwd, "/workspace", str(runner.parent)]:
-                if os.path.isdir(os.path.join(candidate, "node_modules")):
-                    node_cwd = candidate
-                    break
+            node_cwd = _node_cwd(runner)
+
+            proc = await asyncio.create_subprocess_exec(
+                self.config.node_binary,
+                str(runner), code_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=node_cwd,
+            )
 
             outer_timeout = self.config.execution_timeout_ms / 1000.0 + 8.0
             try:
-                res = await _run_node([self.config.node_binary, str(runner), code_path], node_cwd, outer_timeout)
-            except subprocess.TimeoutExpired:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=outer_timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
                 return {"passed": False, "failures": [{"rule": "TIMEOUT_EXCEEDED", "detail": "outer Python timeout"}]}
-            stdout, stderr = res.stdout, res.stderr
 
-            if res.returncode != 0:
+            if proc.returncode != 0:
                 err_text = stderr.decode("utf-8", errors="replace").strip()
                 return {"passed": False, "failures": [{"rule": "EXECUTION_THREW", "detail": err_text[:300]}]}
 

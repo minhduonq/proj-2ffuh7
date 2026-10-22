@@ -9,7 +9,7 @@ from typing import Any
 from config.settings import ProviderRoutingConfig
 from logger_config import logger
 from modules.base_agent import BaseAgent
-from modules.critic.prompts import CRITIC_SYSTEM_PROMPT, CRITIC_USER_TEMPLATE, STRUCT_CRITIC_SYSTEM_PROMPT
+from modules.critic.prompts import CRITIC_SYSTEM_PROMPT, CRITIC_USER_TEMPLATE
 from modules.critic.schema import CriticReport
 from utils.json_extract import extract_json_object
 from utils.retry import async_retry
@@ -104,8 +104,6 @@ class CriticAgent(BaseAgent):
         image_mime: str,
         render_png: bytes,
         artifact_context: dict,
-        seed_override: int | None = None,
-        temperature_override: float | None = None,
     ) -> CriticReport:
         return await run_critic(
             task_id=task_id,
@@ -116,13 +114,13 @@ class CriticAgent(BaseAgent):
             client=self.client,
             model=self.model,
             max_tokens=self.max_tokens,
-            temperature=self.temperature if temperature_override is None else temperature_override,
+            temperature=self.temperature,
             top_p=self.top_p,
             top_k=self.top_k,
             min_p=self.min_p,
             presence_penalty=self.presence_penalty,
             repetition_penalty=self.repetition_penalty,
-            seed=self.seed if seed_override is None else seed_override,
+            seed=self.seed,
             max_retries=self.max_retries,
             reasoning_effort=self.reasoning_effort,
             enable_thinking=self.enable_thinking,
@@ -130,61 +128,6 @@ class CriticAgent(BaseAgent):
             backend=self.backend,
             providers=self.providers,
         )
-
-
-    async def struct_critique(
-        self,
-        *,
-        task_id: str,
-        image_bytes: bytes,
-        image_mime: str,
-        render_png: bytes,
-        js_code: str,
-        seed: int,
-        temperature: float,
-        max_tokens: int = 1600,
-    ) -> dict | None:
-        """Refine: critic KY THUAT DUNG HINH (phang/cong, dac/rong, day/mong, khoi/xoay...).
-
-        Cung prompt va tham so voi nhanh C1 trong lab (viga_refine.py, 26/09).
-        Tra ve {"structural_issues": [...], "verdict": "..."} hoac None neu loi —
-        buoc ve lai van chay voi nhan xet thi giac.
-        """
-        parts = ", ".join(sorted(set(_STRUCT_PART_RE.findall(js_code or "")))[:60]) or "(unreadable)"
-        image_b64 = base64.b64encode(image_bytes).decode()
-        render_b64 = base64.b64encode(render_png).decode()
-        messages = [
-            {"role": "system", "content": STRUCT_CRITIC_SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Reference photo:"},
-                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}},
-                {"type": "text", "text": "Render grid of the current module:"},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{render_b64}"}},
-                {"type": "text", "text": f"Part variable names in the code: {parts}\n\nReturn the JSON now."},
-            ]},
-        ]
-        extra_body: dict[str, Any] = {"top_k": 20}
-        if self.backend == "vllm":
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-        try:
-            t0 = time.time()
-            resp = await self.client.chat.completions.create(
-                model=self.model, messages=messages, temperature=temperature, top_p=0.95,
-                seed=seed, max_tokens=max_tokens, extra_body=extra_body,
-            )
-            raw = (resp.choices[0].message.content or "").split("</think>")[-1]
-            data = json.loads(extract_json_object(raw))
-            logger.info(
-                f"[Refine StructCritic] Task {task_id} | Seed: {seed} | Elapsed: {time.time() - t0:.1f}s | "
-                f"Issues: {len(data.get('structural_issues') or [])} | Verdict: {str(data.get('verdict', ''))[:100]}"
-            )
-            return data
-        except Exception as exc:
-            logger.warning(f"[Refine StructCritic] Task {task_id} | Seed: {seed} | failed: {type(exc).__name__}: {exc}")
-            return None
-
-
-_STRUCT_PART_RE = re.compile(r"const\s+([a-z_][a-z0-9_]*)\s*=\s*new THREE\.(?:Mesh|InstancedMesh|Group)")
 
 
 async def run_critic(

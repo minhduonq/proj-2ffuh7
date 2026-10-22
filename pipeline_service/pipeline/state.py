@@ -4,7 +4,6 @@ import time
 from enum import Enum
 from typing import Any
 
-from pipeline.batch_stats import STATS
 from pipeline.task import PipelineTask
 
 
@@ -36,8 +35,6 @@ class MinerState:
         # in cloud-only deployments — see models_ready() below.
         self.llm_status: dict[str, ServiceState] = {}
         self.replacements_remaining: int = 0
-        # Host diagnostics: preflight metrics, coder-probe tok/s, batch timing. Rendered into the
-        # `// participant-diag:` header of every module in /results (serve.py).
         self.diag: dict[str, Any] = {}
         self.batch_started_at: float | None = None
         self.batch_index: int = 0
@@ -50,7 +47,6 @@ class MinerState:
         self.status = MinerStatus.GENERATING
         self.batch_started_at = time.time()
         self.batch_index += 1
-        STATS.reset(self.batch_started_at)
 
     def record_task(self, task: "PipelineTask") -> None:
         self.tasks[task.stem] = task
@@ -79,7 +75,6 @@ class MinerState:
 
     def mark_complete(self) -> None:
         self.status = MinerStatus.COMPLETE
-        STATS.end()
     
     def set_llm_status(self, name: str, st: ServiceState) -> None:
         self.llm_status[name] = st

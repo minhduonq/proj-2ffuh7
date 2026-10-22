@@ -61,21 +61,8 @@ def build_pipeline(
     critic = CriticAgent(clients[actors.critic.client], settings=actors.critic)
 
     if ensemble_size > 1:
-        # Judge replicas: with `actors.judge.extra_clients` the judge round-robins over several
-        # independent vLLM servers (one per GPU). Two DP=1 servers give ~1.45x the duel throughput
-        # of one DP=2 server on the same GPUs, because vLLM's data-parallel engines step in
-        # lockstep (all-reduce every step) while independent servers do not.
-        judge_client = clients[actors.judge.client]
-        judge_extra = [n for n in actors.judge.extra_clients if n in clients]
-        if judge_extra:
-            judge_names = [actors.judge.client, *judge_extra]
-            judge_client = LoadBalancedClient(
-                [clients[n] for n in judge_names], [1] * len(judge_names)
-            )
-            logger.info(f"Judge load-balanced across {judge_names} | weights={[1] * len(judge_names)}")
         judge: JudgeAgent | None = JudgeAgent(
-            judge_client, settings=actors.judge,
-            max_stage=actors.judge.max_stage,
+            clients[actors.judge.client], settings=actors.judge,
         )
         embedder: DinoEmbedder | None = (
             DinoEmbedder(settings.embedder) if settings.embedder.enabled else None
@@ -100,10 +87,8 @@ def build_pipeline(
         coder_ensemble_temperature=actors.coder.ensemble_temperature,
         render_from_object=settings.pipeline.render_from_object,
         seed_offset=settings.pipeline.seed_offset,
+        bracket=settings.pipeline.bracket,
         orientation=settings.pipeline.orientation,
-        candidate_deadline_s=settings.pipeline.candidate_deadline_s,
-        refine=settings.pipeline.refine,
-        code_fix=settings.pipeline.code_fix,
         refinement_enabled=settings.pipeline.refinement_enabled,
         max_iter=policy.max_iter,
         score_threshold=policy.score_threshold,

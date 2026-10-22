@@ -17,6 +17,9 @@ import { parentPort, workerData } from 'node:worker_threads';
 import * as THREE from 'three';
 import { postValidate } from './postValidation.js';
 
+// Captured before the runtime traps are installed — `process` is trapped
+// by the time postValidate() runs, so the flag must be read up here.
+const SEGMENT_FLOOR_CHECK = process.env.SEGMENT_FLOOR_CHECK === '1';
 const SafeFunction = Function;
 // Capture Date.now BEFORE any traps are installed so worker-internal timing
 // measurements keep working after `Date` is trapped in globalThis.
@@ -194,7 +197,7 @@ function run() {
 
     let postResult;
     try {
-      postResult = postValidate(rawResult);
+      postResult = postValidate(rawResult, { segmentFloorCheck: SEGMENT_FLOOR_CHECK });
     } catch (err) {
       send({
         failures: [{

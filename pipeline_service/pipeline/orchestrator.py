@@ -5,8 +5,8 @@ import time
 
 import httpx
 
+from config.settings import BracketConfig, OrientationConfig
 from llm.session_store import SessionStore
-from config.settings import OrientationConfig, RefineConfig
 from logger_config import logger
 from pipeline.stages import (
     code_and_check,
@@ -16,8 +16,11 @@ from pipeline.stages import (
     renderer_stage,
     StageError,
 )
-from pipeline.refine import refine_regen_stage
 from pipeline.task import PipelineTask
+
+# The hard per-task timeout sits this far past the soft deadline, so multigen has time to cut its
+# bracket and ship before the task is cancelled outright.
+_HARD_DEADLINE_GRACE_S = 15.0
 
 
 class Pipeline:
@@ -47,10 +50,8 @@ class Pipeline:
         coder_ensemble_temperature: float = 0.3,
         render_from_object: bool = False,
         seed_offset: int = 0,
+        bracket: BracketConfig | None = None,
         orientation: OrientationConfig | None = None,
-        candidate_deadline_s: float = 0.0,
-        refine: RefineConfig | None = None,
-        code_fix: bool = False,
         refinement_enabled: bool = True,
         planner_limit: int = 2,
         coder_limit: int = 2,
@@ -74,10 +75,8 @@ class Pipeline:
         self.coder_ensemble_temperature = coder_ensemble_temperature
         self.render_from_object = render_from_object
         self.seed_offset = seed_offset
+        self.bracket = bracket or BracketConfig()
         self.orientation = orientation or OrientationConfig()
-        self.candidate_deadline_s = candidate_deadline_s
-        self.refine = refine or RefineConfig()
-        self.code_fix = code_fix
         self.refinement_enabled = refinement_enabled
 
         self.max_iter = max_iter
@@ -107,7 +106,7 @@ class Pipeline:
             return True
         return False
 
-    async def _run(self, task: PipelineTask) -> None:
+    async def _run(self, task: PipelineTask, deadline: float | None = None) -> None:
 
         # Planner with downloading image
         await prepare_inputs_stage(
@@ -145,11 +144,10 @@ class Pipeline:
                     ensemble_temperature=self.coder_ensemble_temperature,
                     render_from_object=self.render_from_object,
                     seed_offset=self.seed_offset,
+                    bracket=self.bracket,
                     orientation=self.orientation,
-                    candidate_deadline_s=self.candidate_deadline_s,
-                    code_fix=self.code_fix,
+                    deadline=deadline,
                 )
-                await self._maybe_refine(task)
             else:
                 # Next iterations without multigen (base coder, patcher and repair agent)
                 await code_and_check(
@@ -208,69 +206,20 @@ class Pipeline:
             task.rendered_png = task.best_rendered_png
            
 
-    async def _maybe_refine(self, task: PipelineTask) -> None:
-        """Fresh critic-regeneration of the bracket winner inside the batch's time window. Never fails the task.
-
-        Clocks run from the batch start (task.batch_started_at; a retried prompt keeps its batch's clock; warmup
-        falls back to the task start). Past `start_cutoff_s` refine is skipped; at `deadline_s` a running refine is
-        cancelled. The bracket winner is replaced only in the last lines of refine_regen_stage.
-        """
-        cfg = self.refine
-        if not cfg.enabled or self.judge is None or self.critic is None:
-            return
-        if task.stem == "warmup_task":           # keep the startup warmup exactly as long as the baseline's
-            return
-        started = task.batch_started_at or task.started_at or time.time()
-        elapsed = time.time() - started
-        if elapsed > cfg.start_cutoff_s:
-            task.meta["refine"] = {"skipped": f"late: {elapsed:.0f}s > start_cutoff_s {cfg.start_cutoff_s:.0f}s"}
-            logger.info(f"[REFINE] {task.stem} skipped | elapsed={elapsed:.0f}s > {cfg.start_cutoff_s:.0f}s")
-            return
-        budget = cfg.deadline_s - elapsed
-        try:
-            await asyncio.wait_for(
-                refine_regen_stage(
-                    task,
-                    coder=self.coder,
-                    critic=self.critic,
-                    judge=self.judge,
-                    embedder=self.embedder,
-                    js_checker=self.js_checker,
-                    renderer=self.renderer,
-                    sem_coder=self._sem["coder"],
-                    sem_checker=self._sem["js_checker"],
-                    sem_renderer=self._sem["renderer"],
-                    sem_judge=self._sem["judge"],
-                    sem_critic=self._sem["critic"],
-                    status=self.task_status,
-                    n_cand=cfg.candidates,
-                    accept_margin=cfg.accept_margin,
-                    thinking=cfg.thinking,
-                    max_tokens=cfg.max_tokens,
-                    seed_offset=self.seed_offset,
-                    render_from_object=self.render_from_object,
-                    orientation=self.orientation,
-                    code_fix=self.code_fix,
-                ),
-                timeout=budget,
-            )
-        except TimeoutError:
-            info = task.meta.setdefault("refine", {})
-            info["timeout"] = f"deadline_s {cfg.deadline_s:.0f}s (budget {budget:.0f}s)"
-            logger.warning(f"[REFINE] {task.stem} cut at deadline ({budget:.0f}s budget) - bracket winner kept")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - refine must never fail the task
-            task.meta.setdefault("refine", {})["error"] = f"{type(exc).__name__}: {exc}"
-            logger.warning(f"[REFINE] {task.stem} failed: {type(exc).__name__}: {exc} - bracket winner kept")
-
-    async def run_one(self, task: PipelineTask) -> PipelineTask:
+    async def run_one(self, task: PipelineTask, deadline: float | None = None) -> PipelineTask:
+        """Run one task. Its soft deadline is `task_deadline_s` from now or the caller's `deadline`
+        (event-loop clock), whichever is earlier; multigen ships its best candidate at that point."""
         task.started_at = time.time()
         self.task_status[task.stem] = "pending"
+        loop = asyncio.get_running_loop()
+        soft = loop.time() + self.task_deadline_s
+        if deadline is not None:
+            soft = min(soft, deadline)
+        budget_s = soft - loop.time()
 
         try:
-            async with asyncio.timeout(self.task_deadline_s):
-                await self._run(task)
+            async with asyncio.timeout_at(soft + _HARD_DEADLINE_GRACE_S):
+                await self._run(task, soft)
 
             task.failed = False
             task.failure_reason = None
@@ -279,10 +228,10 @@ class Pipeline:
 
         except TimeoutError:
             task.failed = True
-            task.failure_reason = f"budget exceeded ({self.task_deadline_s}s)"
+            task.failure_reason = f"budget exceeded ({budget_s:.0f}s)"
             task.failure_stage = "deadline"
             self.task_status[task.stem] = "failed"
-            logger.warning(f"[DEADLINE] {task.stem} exceeded {self.task_deadline_s}s")
+            logger.warning(f"[DEADLINE] {task.stem} exceeded {budget_s:.0f}s")
 
         except StageError as exc:
             task.failed = True
@@ -312,5 +261,5 @@ class Pipeline:
     async def stop(self) -> None:
         pass
 
-    async def submit(self, task: PipelineTask) -> asyncio.Task[PipelineTask]:
-        return asyncio.create_task(self.run_one(task))
+    async def submit(self, task: PipelineTask, deadline: float | None = None) -> asyncio.Task[PipelineTask]:
+        return asyncio.create_task(self.run_one(task, deadline))

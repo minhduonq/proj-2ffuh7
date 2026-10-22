@@ -1,6 +1,7 @@
 import asyncio
 import multiprocessing
 import queue
+import time
 
 from fastapi import FastAPI
 from logger_config import logger
@@ -65,17 +66,27 @@ async def _abort_generation_and_complete(state: MinerState, generation_task: asy
     
 
 async def _watch_models(state: MinerState, app: FastAPI, pipeline: GenerationPipeline) -> None:
-    """Watch the status of the models and update the state accordingly."""
+    """Watch the status of the models and update the state accordingly.
+
+    While generating, a client counts as down only after failing every probe for
+    `monitoring.down_grace_s`: replacing the pod or aborting drops the whole batch, and a single
+    missed probe is routine when the vLLM API server is busy.
+    """
+    grace = pipeline.settings.monitoring.down_grace_s
+    down_since: dict[str, float] = {}  # client -> monotonic time of its first failed probe in a row
     while True:
         try:
             checkers: dict[str, OrchestratorChecker] = getattr(app.state, "checkers", {}) or {}
+            now = time.monotonic()
             for name, checker in checkers.items():
-                state.set_llm_status(name, checker.result.state)
+                probe_state = checker.result.state
+                state.set_llm_status(name, probe_state)
+                if probe_state == ServiceState.RUNNING:
+                    down_since.pop(name, None)
+                else:
+                    down_since.setdefault(name, now)
 
             if state.status == MinerStatus.WARMING_UP and state.models_ready():
-                # Coder throughput probe (once): batch wall = coder tokens / tok/s, so a slow host shows
-                # up here before any timed batch. Request REPLACE only while replacements remain; with
-                # remaining=0 the /status handler forces WARMING_UP again and the probe is not re-run.
                 probe_cfg = pipeline.settings.pipeline.coder_probe
                 if probe_cfg.enabled and "probe_tps" not in state.diag:
                     tps = await pipeline.run_coder_probe()
@@ -108,8 +119,15 @@ async def _watch_models(state: MinerState, app: FastAPI, pipeline: GenerationPip
                 logger.info(f"models up — ready ({len(checkers)} probed)")
 
             elif state.status == MinerStatus.GENERATING and not state.models_ready():
-                down = [n for n, s in state.llm_status.items() if s != ServiceState.RUNNING]
-                if state.replacements_remaining > 1:
+                failing = {n: now - t for n, t in down_since.items()}
+                down = [n for n, dt in failing.items() if dt >= grace]
+                if not down:
+                    logger.warning(
+                        f"model(s) failing probes: "
+                        f"{', '.join(f'{n} for {dt:.0f}s' for n, dt in failing.items())} — "
+                        f"acting only after {grace:.0f}s"
+                    )
+                elif state.replacements_remaining > 1:
                     logger.warning(
                         f"model(s) down ({down}) | replacements_remaining="
                         f"{state.replacements_remaining} — requesting replace"

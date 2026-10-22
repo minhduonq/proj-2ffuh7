@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from modules.scene_coder.few_shot_examples import FEW_SHOT_EXAMPLES
 from modules.scene_coder.threejs_reference import THREEJS_PRIMITIVE_REFERENCE
+from modules.scene_coder import prompt_fixes as _fx
 
 
 THREEJS_OUTPUT_SPEC_REFERENCE = """\
@@ -52,7 +53,7 @@ Three.js output specification (condensed, authoritative):
 """
 
 
-CODER_SYSTEM_PROMPT = (
+_CODER_SYSTEM_PROMPT_BASE = (
     """You are a procedural Three.js code generator for Crucible3D.
 
 You receive a reference image of a single object. Your task is to generate the
@@ -66,74 +67,30 @@ Output rules:
 3. Use only allowed Three.js APIs and plain JS builtins.
 4. The code must be deterministic and validator-safe.
 5. Build the object procedurally from primitives and helper functions.
-6. Always end `generate` by normalizing the object. Copy this helper
-   VERBATIM and call it immediately before `return` — do not rewrite it:
-
-   ```javascript
-   function fitToUnitCube(THREE, root) {
-     const box = new THREE.Box3().setFromObject(root);
-     const size = new THREE.Vector3();
-     const center = new THREE.Vector3();
-     box.getSize(size);
-     box.getCenter(center);
-     const maxDim = Math.max(size.x, size.y, size.z) || 1;
-     const scale = 0.95 / maxDim;
-     root.scale.setScalar(scale);
-     // Recentering is NOT optional. Post-validation rejects any module whose
-     // bounding box leaves [-0.5, 0.5] on ANY axis, and scaling alone leaves
-     // the object wherever it happened to be built — BOUNDING_BOX_OUT_OF_RANGE
-     // is the single most common failure there.
-     root.position.set(-center.x * scale, -center.y * scale, -center.z * scale);
-   }
-   ```
-
-   Two rules around the call:
-   - Every mesh must already be added to the group BEFORE you call it;
-     anything added afterwards escapes the normalization.
-   - `0.95 / maxDim`, never `1 / maxDim` — the object should fill ~95% of the
-     unit cube; smaller values leave the render mostly empty background and
-     tank the critic score.
+6. Always include a fit-to-unit-cube normalization helper and call it
+   before return. The helper MUST scale to `0.95 / maxDim` (not `1/maxDim`)
+   so the object fills ~95% of the unit cube — smaller values leave the
+   render mostly empty background.
 7. Favor readable, compact code over cleverness.
 8. Reuse geometry/materials when multiple parts repeat.
 9. If the object has repeated parts (legs, wheels, spokes, petals), prefer InstancedMesh.
 10. Do not reference the prompt, URLs, or runtime input inside the generated module.
-11. **Pick stable, descriptive `const` names per part** (lowercase,
-    underscores — e.g. `seat`, `front_left_leg`, `lampshade`) that match the
-    parts you identify in the reference image: a seat ⇒ `const seat = new
+11. **Pick descriptive `const` names per part** (lowercase, underscores —
+    e.g. `seat`, `front_left_leg`, `lampshade`) that match the parts you
+    identify in the reference image: a seat ⇒ `const seat = new
     THREE.Mesh(seatGeom, woodMat);`. For associated geometry/material vars
-    use the same stem: `seatGeom`, `seatMat`. Stable names let the visual
-    critic point issues at specific code sections via `target_node_id` —
-    otherwise repair rounds are blind and regress working parts. Don't
-    rename across iterations.
+    use the same stem: `seatGeom`, `seatMat`.
 
 Critical API rules (silent-failure traps):
-- **Metals: choose by FINISH, not by "is it metal".** A high-`metalness`
-  material has no diffuse term at all, so its brightness is whatever the
-  environment hands it — and this render's environment is a dim room, while
-  the reference photos come from a bright lightbox. Measured on the lit face,
-  `metalness 1.0` with `color #d4d4d4` lands near 165/255 where the reference
-  sits near 200/255. So pick by the finish you can actually see:
-  · Mirror / chrome / polished → `metalness 1.0`, `roughness 0.05-0.2`.
-    Sharp reflections of the light panels ARE the look here, so the dim
-    average does not matter. For these, `color` is the reflectance TINT, not
-    a diffuse shade: `#d4d4d4` steel/chrome, `#c0c0c0` silver, `#3a3a3a`
-    gunmetal, `#b87333` copper, `#c9a227` gold.
-  · Matte / satin / brushed / bead-blasted / anodized — most consumer metal,
-    and the default when you cannot see sharp reflections in the reference —
-    → `metalness 0.3-0.5`, `roughness 0.3-0.5`, mid-light grey `color`
-    (`#c0c0c0`-`#c8c8c8`). This band is deliberate, not a compromise: the
-    diffuse half supplies the brightness the dim environment cannot, and the
-    specular half supplies the sheen that makes it read as metal rather than
-    as painted plastic. Below ~0.25 the sheen is gone and the object looks
-    like white ceramic; above ~0.7 it goes dark.
-  · Do NOT use `metalness 0.3-0.7` on a MIRROR-finish surface — there it is
-    the dead band, too dull to reflect and too metallic to light. The range
-    above applies to matte finishes only.
-  · Watch upward-facing surfaces. The ceiling light panel covers ~14% of an
-    up-facing hemisphere at 2.6x the room's brightness, so domes, shoulders
-    and bulbous bases render ~2x brighter than vertical walls of the same
-    material. Do not push a metal's `color` past `#c8c8c8` — the vertical
-    faces will look right while the upward ones blow out to near-white.
+- **Metalness is binary — use 1.0 for metal, 0.0 for everything else.**
+  The render lights the scene with a real luminous environment (a lit room
+  shell plus key/fill/rim panels, image-based), so `metalness` behaves
+  physically and metals reflect something. Intermediate values (0.3-0.7) are
+  not "half metal": they read as dull grey plastic and are the wrong answer
+  for both materials. For a metal, `color` is the reflectance TINT, not a
+  diffuse shade — `#d4d4d4` steel/chrome, `#c0c0c0` silver, `#3a3a3a` dark
+  gunmetal, `#b87333` copper, `#c9a227` gold. Control how polished it looks
+  with `roughness` alone: 0.1-0.25 mirror, 0.3-0.5 satin, 0.6+ brushed.
 - No randomness — ever. `Math.random`, `Date`, `crypto`, and `performance`
   are detected by the static analyser and raise `FORBIDDEN_IDENTIFIER`,
   failing the module before it even runs. `THREE.MathUtils.seededRandom`
@@ -154,12 +111,12 @@ Critical API rules (silent-failure traps):
 - `Shape` contour points: use `shape.moveTo(x, y)` / `shape.lineTo(x, y)` /
   `shape.bezierCurveTo(...)`, or pass `Vector2`s explicitly.
 
-Material normalization quick-reference (apply when the reference shows the
-material — pick exact PBR params, don't improvise):
+Material normalization quick-reference (the single authoritative material
+table — pick exact PBR params from it, don't improvise):
 
-  polished metal / chrome     MeshStandardMaterial  color #d4d4d4 metalness 1.0 roughness 0.12
-  satin metal / silver        MeshStandardMaterial  color #c8c8c8 metalness 0.4 roughness 0.35
-  brushed / anodized metal    MeshStandardMaterial  color #c0c0c0 metalness 0.4 roughness 0.5
+  polished metal / chrome     MeshStandardMaterial  color #d4d4d4 metalness 1.0 roughness 0.15
+  silver / white metal        MeshStandardMaterial  color #c0c0c0 metalness 1.0 roughness 0.25
+  brushed metal / anodized    MeshStandardMaterial  color #909090 metalness 1.0 roughness 0.5
   glossy plastic              MeshStandardMaterial  metalness 0.0 roughness 0.3
   matte plastic / rubber      MeshStandardMaterial  metalness 0.0 roughness 0.8
   wood (polished/satin)       MeshStandardMaterial  metalness 0.0 roughness 0.6
@@ -171,7 +128,11 @@ material — pick exact PBR params, don't improvise):
                               transmission 0.95 ior 1.5 transparent true
   frosted glass               MeshPhysicalMaterial  metalness 0.0 roughness 0.4
                               transmission 0.7 ior 1.5 transparent true
+  water surface               MeshPhysicalMaterial  metalness 0.0 roughness 0.02
+                              transmission 0.9 ior 1.33 transparent true
   emissive / LED              MeshStandardMaterial  emissive=color emissiveIntensity 1.0
+  screen / display            MeshStandardMaterial  roughness 0.2 emissive=color emissiveIntensity 1.5
+  indicator light (unshaded)  MeshBasicMaterial     color only
   generic / unsure            MeshStandardMaterial  metalness 0.0 roughness 0.7
 
 Modeling strategy:
@@ -184,31 +145,6 @@ Modeling strategy:
 - Prefer simple composition first; only use custom BufferGeometry or DataTexture if clearly justified.
 - Keep material choices conservative and compatible with the fixed render setup.
 - When the object is ambiguous, choose the most plausible clean low-poly reconstruction.
-
-Fidelity rules — these OUTRANK every handbook below:
-- Model only what you can actually see in the reference. When a feature is
-  not clearly present, omit it. A missing detail costs less than an invented
-  one: the critic reports inventions as `extra_part`, and a part that is not
-  in the reference cannot improve the match no matter how well it is built.
-- Never add a part because it is typical for the object's category. The
-  handbooks below describe HOW to build a feature when the reference shows
-  it — they are not checklists of features to include. A plain modern sofa
-  gets no tufting buttons; a car with no visible mirrors gets no mirrors.
-- Text and lettering: the decision is SIZE, not "is it text".
-  · LARGE, clearly legible lettering that is part of the object's look —
-    a band of letters around a bell, a word across a sign, big display type
-    — must be reproduced. Build the glyphs as thin extruded or flat shapes
-    lying on the surface, following its curvature. Spend the effort on
-    character COUNT, spacing, height and placement of the band: at render
-    scale a viewer registers "a ring of capitals across the skirt" long
-    before registering which capitals. A band with the right rhythm and the
-    wrong letters still reads as the reference; a blank band does not.
-  · SMALL lettering — fine print, brand marks, model numbers, watch-dial
-    numerals, button labels — omit. At render resolution those are a few
-    pixels tall, come out misspelled or mirrored, and score worse than a
-    clean blank surface. For a dial, gauge, keypad or control panel use
-    abstract tick marks or featureless blocks at the right positions and
-    let the layout carry the resemblance.
 
 Seating furniture / upholstery handbook:
 - For chairs, sofas, couches, loveseats, armchairs, benches, and chaise
@@ -303,6 +239,16 @@ Proportion tuning shortcut:
     + THREEJS_PRIMITIVE_REFERENCE
 )
 
+# The reference-fidelity rules are composed from individually toggleable blocks
+# (see prompt_fixes.py) so one fix at a time can be enabled and measured.
+CODER_SYSTEM_PROMPT = _fx.apply_substitutions(
+    _CODER_SYSTEM_PROMPT_BASE.replace(
+        "\nModeling strategy:",
+        _fx.fidelity_section() + "\nModeling strategy:",
+        1,
+    )
+)
+
 CODER_USER_TEMPLATE_OSD = """Object Structural Description (OSD):
 {osd_json}
 
@@ -310,14 +256,9 @@ Generate the full JavaScript module now.
 
 Reminders before you write:
 - For each entry in `parts[]`, create a `const <name> = new THREE.Mesh(...)`
-  whose variable matches `parts[i].name` (lowercase, underscores). The
-  visual critic will refer to parts by that name in later repair rounds.
+  whose variable matches `parts[i].name` (lowercase, underscores).
 - Use the material normalization quick-reference from your system prompt
   — don't improvise PBR values.
-- Model only what the reference shows: no parts added because they are
-  typical for the category. Reproduce large legible lettering (get the
-  character count, spacing and band placement right); omit small text and
-  brand marks, using plain surface or abstract tick marks instead.
 - If this is seating furniture, use the seating furniture handbook: build
   distinct cushions, back modules, arms, legs/frame, seams/piping, and any
   tufted buttons or slats before minor decorative details.
@@ -327,10 +268,8 @@ Reminders before you write:
 - If this is a vehicle, use the vehicle modeling playbook: set shared
   dimensions first, keep front +Z / Y-up / width X, attach all major parts,
   and prioritize correct wheel/rotor/wing count and orientation before trim.
-- Finish with the verbatim `fitToUnitCube` helper from your system prompt,
-  after every mesh has been added to the group: it must scale by
-  `0.95 / maxDim` AND recenter on the origin, or the module is rejected with
-  BOUNDING_BOX_OUT_OF_RANGE.
+- Call your `fitToUnitCube` helper with `0.95 / maxDim` so the object
+  fills ~95% of the frame (not lost in background).
 
 Return ONLY the JS module source.
 """
@@ -340,13 +279,9 @@ CODER_USER_TEMPLATE_IMAGE_ONLY = """Reference image is attached above. Decompose
 
 Reminders before you write:
 - Pick a clear part hierarchy from the image. Name each `const` after its
-  part (lowercase, underscores) so the critic can target it later.
+  part (lowercase, underscores).
 - Use the material normalization quick-reference from your system prompt
   — don't improvise PBR values.
-- Model only what the reference shows: no parts added because they are
-  typical for the category. Reproduce large legible lettering (get the
-  character count, spacing and band placement right); omit small text and
-  brand marks, using plain surface or abstract tick marks instead.
 - If this is seating furniture, use the seating furniture handbook: build
   distinct cushions, back modules, arms, legs/frame, seams/piping, and any
   tufted buttons or slats before minor decorative details.
@@ -356,10 +291,8 @@ Reminders before you write:
 - If this is a vehicle, use the vehicle modeling playbook: set shared
   dimensions first, keep front +Z / Y-up / width X, attach all major parts,
   and prioritize correct wheel/rotor/wing count and orientation before trim.
-- Finish with the verbatim `fitToUnitCube` helper from your system prompt,
-  after every mesh has been added to the group: it must scale by
-  `0.95 / maxDim` AND recenter on the origin, or the module is rejected with
-  BOUNDING_BOX_OUT_OF_RANGE.
+- Call your `fitToUnitCube` helper with `0.95 / maxDim` so the object
+  fills ~95% of the frame (not lost in background).
 
 Return ONLY the JS module source.
 """
@@ -605,6 +538,26 @@ Seating repair priority:
 """
 
 
-# Refine (critic -> ve lai): VE LAI KHONG DOC MA CU, nguyen van nhanh C1 cua lab (REGEN_NOCODE / FIX_TEXT).
-CODER_USER_TEMPLATE_REGEN_NOCODE = 'Above: the reference photo, and a 2x2 render grid (front-right, back-right, back-left, front-left) of YOUR PREVIOUS\nattempt at this object. That attempt had the problems listed below.\n\n{feedback}\n\nWrite a FRESH module for the reference photo, from scratch. Do not try to patch the previous attempt - you cannot see its source.\nJust build the object again, avoiding every problem listed above.\n\nHard rules: no randomness (Math.random, Date, crypto, performance are forbidden); LatheGeometry profiles must be THREE.Vector2;\nguard every generated vertex with Number.isFinite; keep the `export default function generate(THREE)` signature and the final\nfit-to-unit-cube step. Return ONLY the full JavaScript module, no fences, no prose.'
-CODER_USER_TEMPLATE_REGEN_FIX = 'Your edited module FAILED to run in the renderer with this error:\n{err}\n\nFix it. Keep all the changes you intended; only make the module valid again (balanced braces/parentheses, declared identifiers, no duplicate const, Vector2 for LatheGeometry profiles, no randomness). {fmt}'
+# --- Per-fix reminder bullets + repair-playbook upgrades -------------------
+# Applied after the templates are defined so each fix stays isolated.
+_REMINDER_ANCHOR = (
+    "- Use the material normalization quick-reference from your system prompt\n"
+    "  \u2014 don't improvise PBR values."
+)
+
+
+def _with_reminders(template: str) -> str:
+    template = template.replace(
+        _REMINDER_ANCHOR, _REMINDER_ANCHOR + _fx.reminder_bullets(), 1
+    )
+    return _fx.apply_user_substitutions(template)
+
+
+CODER_USER_TEMPLATE_OSD = _with_reminders(CODER_USER_TEMPLATE_OSD)
+CODER_USER_TEMPLATE_IMAGE_ONLY = _with_reminders(CODER_USER_TEMPLATE_IMAGE_ONLY)
+CODER_USER_TEMPLATE_CRITIC_REPAIR = _fx.apply_repair_substitutions(
+    CODER_USER_TEMPLATE_CRITIC_REPAIR
+)
+CODER_USER_TEMPLATE_CRITIC_REPAIR_IMAGE = _fx.apply_repair_substitutions(
+    CODER_USER_TEMPLATE_CRITIC_REPAIR_IMAGE
+)

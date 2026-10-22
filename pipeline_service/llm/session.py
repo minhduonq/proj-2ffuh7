@@ -4,7 +4,6 @@ import json
 import re
 from typing import Any, Generic, TypeVar
 
-from openai import APITimeoutError
 from pydantic import BaseModel, ValidationError
 
 from config.settings import ProviderRoutingConfig
@@ -211,9 +210,7 @@ class SessionAgent(Generic[T]):
                                 return await self.client.chat.completions.create(**kwargs)
                     raise
 
-            # A timeout already cost request_timeout_s; a retry would spend it again on the same
-            # (probably wedged) request. Let the candidate drop instead.
-            response = await async_retry(_make_call, max_retries=2, no_retry=(APITimeoutError,))
+            response = await async_retry(_make_call, max_retries=2)
             choice = response.choices[0]
             msg = choice.message
 
